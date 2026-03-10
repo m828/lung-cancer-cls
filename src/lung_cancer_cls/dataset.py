@@ -24,6 +24,15 @@ ALIASES = {
     "malignant": "malignant",
     "m": "malignant",
     "cancer": "malignant",
+    "normal cases": "normal",
+    "benign cases": "benign",
+    "malignant cases": "malignant",
+    "bengin": "benign",  # handle misspelling
+    "bengin case": "benign",
+    "bengin cases": "benign",
+    "normal case": "normal",
+    "benign case": "benign",
+    "malignant case": "malignant",
 }
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -45,24 +54,62 @@ def discover_iqothnccd_samples(root: str | Path) -> List[Sample]:
     This supports both:
     - root/{normal,benign,malignant}/*.png
     - root/**/{Normal,Benign,Malignant}/**/*.jpg
+    - Also checks filenames for category keywords
     """
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"Dataset path not found: {root}")
 
+    # Direct map from folder keywords to label - order matters! Longer patterns first!
+    folder_label_map = [
+        ("malignant cases", 2),
+        ("malignant case", 2),
+        ("cancer cases", 2),
+        ("cancer case", 2),
+        ("benign cases", 1),
+        ("benign case", 1),
+        ("bengin cases", 1),
+        ("bengin case", 1),
+        ("normal cases", 0),
+        ("normal case", 0),
+        ("healthy cases", 0),
+        ("healthy case", 0),
+        ("malignant", 2),
+        ("cancer", 2),
+        ("bengin", 1),
+        ("benign", 1),
+        ("normal", 0),
+        ("healthy", 0),
+        ("m", 2),
+        ("b", 1),
+        ("n", 0),
+    ]
+
     samples: List[Sample] = []
-    for p in root.rglob("*"):
-        if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+
+    # Get all subdirectories in root
+    for category_dir in root.iterdir():
+        if not category_dir.is_dir():
             continue
 
-        matched_label = None
-        for part in p.parts:
-            cname = canonicalize_class_name(part)
-            if cname is not None:
-                matched_label = CLASS_NAME_TO_ID[cname]
-        if matched_label is None:
-            continue
-        samples.append(Sample(image_path=p, label=matched_label))
+        # Determine label from category directory name
+        dir_name_lower = category_dir.name.lower()
+        label = -1
+
+        # Find matching category keyword in directory name
+        for keyword, l in folder_label_map:
+            if keyword in dir_name_lower:
+                label = l
+                break
+
+        if label == -1:
+            continue  # skip directories that don't match any category
+
+        # Find all image files in this category directory
+        for p in category_dir.iterdir():
+            if not p.is_file() or p.suffix.lower() not in IMG_EXTS:
+                continue
+            samples.append(Sample(image_path=p, label=label))
 
     if not samples:
         raise RuntimeError(

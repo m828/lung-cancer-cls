@@ -16,6 +16,7 @@ class DatasetType(Enum):
     """支持的数据集类型"""
     IQ_OTHNCCD = auto()
     LUNA16 = auto()
+    INTRANET_CT = auto()
 
 
 @dataclass
@@ -243,6 +244,109 @@ class LUNA16Dataset(BaseCTDataset):
 
 
 # ======================================
+# 内网 CT 数据集
+# ======================================
+
+INTRANET_LABEL_MAP: Dict[str, int] = {
+    "健康对照": 0,
+    "良性结节": 1,
+    "肺癌": 2,
+}
+
+
+class IntranetCTDataset(BaseCTDataset):
+    """内网 CT 三分类数据集（基于索引表读取 .npy）"""
+
+    def __init__(self, samples: Sequence[Sample], transform: Callable | None = None):
+        self.samples = list(samples)
+        self.transform = transform
+
+    def get_samples(self) -> List[Sample]:
+        return self.samples
+
+    @classmethod
+    def discover(cls, root: Path, **kwargs) -> "IntranetCTDataset":
+        """
+        从内网索引表发现样本。
+
+        kwargs:
+            metadata_csv: 索引 CSV 路径（默认 root / "多模态统一检索表_CT本地路径_CT划分.csv"）
+            ct_root: CT 数据根目录（默认 root）
+            ct_path_col: CT 路径列名（默认 "CT_numpy_cloud路径"）
+            label_col: 标签列名（默认 "样本类型"）
+            split_col: 划分列名（默认 "CT_train_val_split"）
+        """
+        import pandas as pd
+
+        metadata_csv = Path(kwargs.get("metadata_csv", root / "多模态统一检索表_CT本地路径_CT划分.csv"))
+        ct_root = Path(kwargs.get("ct_root", root))
+        ct_path_col = kwargs.get("ct_path_col", "CT_numpy_cloud路径")
+        label_col = kwargs.get("label_col", "样本类型")
+        split_col = kwargs.get("split_col", "CT_train_val_split")
+
+        if not metadata_csv.exists():
+            raise FileNotFoundError(f"Metadata CSV not found: {metadata_csv}")
+        if not ct_root.exists():
+            raise FileNotFoundError(f"CT root not found: {ct_root}")
+
+        df = pd.read_csv(metadata_csv).fillna("PANDASNAN")
+        samples: List[Sample] = []
+
+        for _, row in df.iterrows():
+            label_name = str(row.get(label_col, "")).strip()
+            if label_name not in INTRANET_LABEL_MAP:
+                continue
+            label = INTRANET_LABEL_MAP[label_name]
+
+            ct_rel = row.get(ct_path_col, "PANDASNAN")
+            if ct_rel == "PANDASNAN":
+                continue
+
+            rel_path = str(ct_rel).replace("\\", "/").lstrip("/")
+            ct_path = ct_root / rel_path
+            if not ct_path.exists():
+                continue
+
+            split = str(row.get(split_col, "")).strip().lower()
+            samples.append(
+                Sample(
+                    image_path=ct_path,
+                    label=label,
+                    metadata={"split": split} if split else None,
+                )
+            )
+
+        if not samples:
+            raise RuntimeError("No valid intranet CT samples discovered from metadata table")
+        return cls(samples)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        sample = self.samples[idx]
+        arr = np.load(sample.image_path).astype(np.float32)
+
+        # 兼容 3D 体数据：取中间层作为 2D 输入
+        if arr.ndim == 3:
+            arr = arr[arr.shape[0] // 2]
+        elif arr.ndim != 2:
+            raise ValueError(f"Unsupported CT array shape: {arr.shape}, path={sample.image_path}")
+
+        # min-max 到 [0, 255]，再转 PIL 走统一 transform
+        arr = arr - arr.min()
+        max_val = arr.max()
+        if max_val > 0:
+            arr = arr / max_val
+        arr = (arr * 255.0).astype(np.uint8)
+        img = Image.fromarray(arr, mode="L")
+
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, sample.label
+
+
+# ======================================
 # 工厂函数
 # ======================================
 
@@ -252,6 +356,8 @@ def create_dataset(dataset_type: DatasetType, root: Path, **kwargs) -> BaseCTDat
         return IQOTHNCCDDataset.discover(root, **kwargs)
     elif dataset_type == DatasetType.LUNA16:
         return LUNA16Dataset.discover(root, **kwargs)
+    elif dataset_type == DatasetType.INTRANET_CT:
+        return IntranetCTDataset.discover(root, **kwargs)
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 

@@ -40,6 +40,9 @@ class TrainConfig:
     cpu: bool = False
     model: str = "simple"
     pretrained: bool = False
+    metadata_csv: Path | None = None
+    ct_root: Path | None = None
+    use_predefined_split: bool = False
 
 
 def set_seed(seed: int) -> None:
@@ -188,7 +191,13 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     # 1. 创建数据集
     print("\n正在加载数据集...")
-    full_dataset = create_dataset(config.dataset_type, config.data_root)
+    dataset_kwargs: Dict[str, Any] = {}
+    if config.dataset_type == DatasetType.INTRANET_CT:
+        if config.metadata_csv is not None:
+            dataset_kwargs["metadata_csv"] = config.metadata_csv
+        if config.ct_root is not None:
+            dataset_kwargs["ct_root"] = config.ct_root
+    full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
     samples = full_dataset.get_samples()
     print(f"找到 {len(samples)} 个样本")
 
@@ -202,9 +211,28 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         print(f"  {class_name} (label={label}): {label_counts[label]}")
 
     # 2. 数据划分
-    train_idx, val_idx, test_idx = stratified_split(
-        samples, config.train_ratio, config.seed
-    )
+    train_idx, val_idx, test_idx = stratified_split(samples, config.train_ratio, config.seed)
+
+    # 可选：使用数据表中的预定义划分（适合内网数据）
+    if config.use_predefined_split:
+        split_to_idx = defaultdict(list)
+        for idx, s in enumerate(samples):
+            split = ""
+            if s.metadata is not None:
+                split = str(s.metadata.get("split", "")).lower().strip()
+            split_to_idx[split].append(idx)
+
+        predefined_train = split_to_idx.get("train", [])
+        predefined_val = split_to_idx.get("val", []) + split_to_idx.get("valid", [])
+        predefined_test = split_to_idx.get("test", [])
+
+        if predefined_train and (predefined_val or predefined_test):
+            train_idx = predefined_train
+            val_idx = predefined_val
+            test_idx = predefined_test
+            print("使用 metadata 预定义划分")
+        else:
+            print("预定义划分不可用，回退为统一分层划分")
     print(f"\n数据划分: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     # 3. 获取数据增强
@@ -216,16 +244,21 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 重新应用 transform（因为 create_dataset 返回的可能没有 transform）
     # 这里我们使用相同的 samples，但创建新的带 transform 的 dataset
     # 先获取样本列表，然后创建带 transform 的数据集
-    from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset
+    from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, IntranetCTDataset
 
     if config.dataset_type == DatasetType.IQ_OTHNCCD:
         train_ds = Subset(IQOTHNCCDDataset(samples, transform=train_tf), train_idx)
         val_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), val_idx)
         test_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), test_idx)
     else:
-        train_ds = Subset(LUNA16Dataset(samples, transform=train_tf), train_idx)
-        val_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), val_idx)
-        test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
+        if config.dataset_type == DatasetType.LUNA16:
+            train_ds = Subset(LUNA16Dataset(samples, transform=train_tf), train_idx)
+            val_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), val_idx)
+            test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
+        else:
+            train_ds = Subset(IntranetCTDataset(samples, transform=train_tf), train_idx)
+            val_ds = Subset(IntranetCTDataset(samples, transform=val_test_tf), val_idx)
+            test_ds = Subset(IntranetCTDataset(samples, transform=val_test_tf), test_idx)
 
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
@@ -331,8 +364,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 必需参数
     parser.add_argument(
-        "--dataset-type", type=str, choices=["iqothnccd", "luna16"],
-        required=True, help="数据集类型: iqothnccd 或 luna16"
+        "--dataset-type", type=str, choices=["iqothnccd", "luna16", "intranet_ct"],
+        required=True, help="数据集类型: iqothnccd / luna16 / intranet_ct"
     )
     parser.add_argument(
         "--data-root", type=str, required=True,
@@ -342,6 +375,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir", type=str, required=True,
         help="输出目录"
     )
+    parser.add_argument("--metadata-csv", type=str, default=None, help="内网数据索引 CSV 路径")
+    parser.add_argument("--ct-root", type=str, default=None, help="内网 CT .npy 根目录")
+    parser.add_argument("--use-predefined-split", action="store_true", help="使用索引表中的 train/val/test 划分")
 
     # 训练参数
     parser.add_argument(
@@ -370,7 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--train-ratio", type=float, default=0.8,
-        help="训练集比例 (默认: 0.8)，剩余 20% 平分为验证集和测试集"
+        help="训练集比例 (默认: 0.8)，剩余 20%% 平分为验证集和测试集"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -404,6 +440,8 @@ def main():
         dataset_type = DatasetType.IQ_OTHNCCD
     elif dataset_str == "luna16":
         dataset_type = DatasetType.LUNA16
+    elif dataset_str == "intranet_ct":
+        dataset_type = DatasetType.INTRANET_CT
     else:
         raise ValueError(f"Unknown dataset type: {args.dataset_type}")
 
@@ -422,6 +460,9 @@ def main():
         cpu=args.cpu,
         model=args.model,
         pretrained=args.pretrained,
+        metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
+        ct_root=Path(args.ct_root) if args.ct_root else None,
+        use_predefined_split=args.use_predefined_split,
     )
 
     train_model(config)

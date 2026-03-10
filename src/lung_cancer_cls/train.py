@@ -366,7 +366,13 @@ def main():
     args = build_parser().parse_args()
 
     # 将字符串转换为枚举
-    dataset_type = DatasetType[args.dataset_type.upper().replace("-", "_")]
+    dataset_str = args.dataset_type.lower().strip()
+    if dataset_str == "iqothnccd":
+        dataset_type = DatasetType.IQ_OTHNCCD
+    elif dataset_str == "luna16":
+        dataset_type = DatasetType.LUNA16
+    else:
+        raise ValueError(f"Unknown dataset type: {args.dataset_type}")
 
     config = TrainConfig(
         dataset_type=dataset_type,

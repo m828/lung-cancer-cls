@@ -1,11 +1,11 @@
 # lung-cancer-cls
 
-一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD 和 LUNA16 两个数据集，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
+一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD、LUNA16 和内网 CT（`intranet_ct`）三个数据来源，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
 
 ## 1. 目标
 
 - 统一训练框架：数据划分、训练循环、验证完全一致
-- 支持两个数据集：IQ-OTH/NCCD（2D 图像）和 LUNA16（3D CT 切片）
+- 支持三个数据源：IQ-OTH/NCCD（2D 图像）、LUNA16（3D CT 切片）、内网 CT（CSV 索引 + .npy）
 - 先在公开数据集 IQ-OTH/NCCD 上跑通，再扩展到 LUNA16
 - 输出可迁移到内网数据的训练骨架
 
@@ -104,6 +104,28 @@ python train.py \
 | `--pretrained` | 使用 ImageNet 预训练（仅 resnet18） | False |
 | `--cpu` | 强制使用 CPU | False |
 | `--seed` | 随机种子 | 42 |
+
+### 内网 CT（intranet_ct）额外参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|---------|
+| `--metadata-csv` | 内网索引表 CSV 路径 | `data-root/多模态统一检索表_CT本地路径_CT划分.csv` |
+| `--ct-root` | CT `.npy` 根目录 | `data-root` |
+| `--use-predefined-split` | 使用 CSV 中的 `train/val/test` 划分 | False |
+
+示例：
+
+```bash
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /home/apulis-dev/userdata \
+  --metadata-csv /home/apulis-dev/userdata/mmy/ct/多模态统一检索表_CT本地路径_CT划分.csv \
+  --ct-root /home/apulis-dev/userdata/Data/CT1500 \
+  --use-predefined-split \
+  --output-dir outputs/intranet_ct_resnet18 \
+  --model resnet18 \
+  --epochs 30
+```
 
 ## 6. 训练结果
 

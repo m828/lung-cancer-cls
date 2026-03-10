@@ -59,6 +59,8 @@ def stratified_split(
     统一的数据划分方法（与 project366.ipynb 一致）
     先 80-20 划分为训练集和临时集，再将临时集 50-50 划分为验证集和测试集
     最终比例：80-10-10
+
+    处理小类别样本数不足的情况
     """
     from sklearn.model_selection import train_test_split
     by_label: Dict[int, List[int]] = defaultdict(list)
@@ -67,11 +69,23 @@ def stratified_split(
 
     train_idx, val_idx, test_idx = [], [], []
     for _, idxs in by_label.items():
+        # 处理样本数极少的情况
+        if len(idxs) <= 2:
+            # 如果类别样本数 <= 2，则全部放入训练集
+            train_idx.extend(idxs)
+            continue
+
         # 第一次划分：训练集 vs 临时集 (80-20)
         train_imgs, temp_imgs = train_test_split(
             idxs, test_size=(1 - train_ratio),
             random_state=seed, shuffle=True
         )
+
+        # 处理临时集样本数不足的情况
+        if len(temp_imgs) <= 1:
+            train_idx.extend(idxs)
+            continue
+
         # 第二次划分：临时集分为验证集和测试集 (50-50)
         val_imgs, test_imgs = train_test_split(
             temp_imgs, test_size=0.5,
@@ -81,6 +95,25 @@ def stratified_split(
         train_idx.extend(train_imgs)
         val_idx.extend(val_imgs)
         test_idx.extend(test_imgs)
+
+    # 检查是否有验证集和测试集，如果没有，随机从训练集中分配一些
+    if len(val_idx) == 0 or len(test_idx) == 0:
+        # 确保至少有一些样本用于验证和测试
+        if len(val_idx) == 0:
+            # 从训练集中随机选择一些作为验证集
+            num_val = min(5, max(1, len(train_idx) // 20))
+            val_indices = random.sample(train_idx, num_val)
+            for idx in val_indices:
+                val_idx.append(idx)
+                train_idx.remove(idx)
+        if len(test_idx) == 0:
+            # 从训练集中随机选择一些作为测试集
+            num_test = min(5, max(1, len(train_idx) // 20))
+            test_indices = random.sample(train_idx, num_test)
+            for idx in test_indices:
+                test_idx.append(idx)
+                train_idx.remove(idx)
+
     return train_idx, val_idx, test_idx
 
 

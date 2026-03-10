@@ -75,6 +75,16 @@ python prepare_luna16_slices.py \
   --subsets 0,1,2 \
   --slices-per-series 20
 
+  ============================================================
+  数据集统计:
+    正常 (normal): 5289
+    良性 (benign): 19
+    恶性 (malignant): 32
+    总计: 5340 张切片
+    输出目录: /workspace/data-lung/luna16/extracted_slices
+  ============================================================
+  样本列表已保存到: /workspace/data-lung/luna16/extracted_slices/samples.csv
+
 # 2. 再训练
 python train.py \
   --dataset-type luna16 \

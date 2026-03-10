@@ -1,24 +1,35 @@
 # lung-cancer-cls
 
-一个可直接运行的 **肺癌 CT 三分类基线仓库**，用于先提升 CT 模态精度，后续再并入文本/基因多模态。
+一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD 和 LUNA16 两个数据集，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
 
 ## 1. 目标
 
-- 先把 CT-only 分类流程标准化（normal / benign / malignant）
-- 在公开数据集 IQ-OTH/NCCD 上先跑通
+- 统一训练框架：数据划分、训练循环、验证完全一致
+- 支持两个数据集：IQ-OTH/NCCD（2D 图像）和 LUNA16（3D CT 切片）
+- 先在公开数据集 IQ-OTH/NCCD 上跑通，再扩展到 LUNA16
 - 输出可迁移到内网数据的训练骨架
 
-## 2. 数据集
+## 2. 项目结构
 
-Kaggle: `IQ-OTHNCCD Lung Cancer Dataset`
-
-下载后解压，保证目录中包含类别名（大小写不敏感）：
-
-- `normal` / `healthy`
-- `benign`
-- `malignant` / `cancer`
-
-脚本会递归扫描目录，只要路径任一层级包含上述类别名即可自动识别标签。
+```
+lung-cancer-cls/
+├── src/lung_cancer_cls/
+│   ├── dataset.py          # 统一的数据集接口
+│   │   ├── BaseCTDataset     # 基类
+│   │   ├── IQOTHNCCDDataset  # IQ-OTH/NCCD 实现
+│   │   └── LUNA16Dataset     # LUNA16 实现
+│   ├── model.py            # 模型定义（保持不变）
+│   └── train.py            # 统一的训练框架
+│       ├── TrainConfig       # 配置类
+│       ├── train_model       # 统一训练函数
+│       └── stratified_split  # 统一数据划分
+├── train.py                # 统一训练入口
+├── train_iqothnccd.py       # IQ-OTH/NCCD 快捷训练
+├── train_luna16.py          # LUNA16 快捷训练
+├── prepare_luna16_slices.py # LUNA16 切片提取
+├── requirements.txt          # 依赖
+└── TRAINING_GUIDE.md        # 统一训练框架使用说明
+```
 
 ## 3. 安装
 
@@ -26,31 +37,118 @@ Kaggle: `IQ-OTHNCCD Lung Cancer Dataset`
 pip install -r requirements.txt
 ```
 
-## 4. 训练
+## 4. 快速开始
 
+### 方式一：使用快捷脚本（最简单）
+
+**训练 IQ-OTH/NCCD**
 ```bash
-PYTHONPATH=src python train_ct.py \
-  --data-root /path/to/iqothnccd \
-  --output-dir outputs/ct_baseline \
-  --epochs 10 \
-  --batch-size 16
+cd /workspace/lung-cancer-cls
+python train_iqothnccd.py
 ```
 
-产物：
+**训练 LUNA16**
+```bash
+cd /workspace/lung-cancer-cls
+python train_luna16.py
+```
 
-- `outputs/ct_baseline/best_model.pt`
-- `outputs/ct_baseline/metrics.json`
+### 方式二：使用统一训练脚本（灵活）
 
-## 5. 迁移到内网建议
+**训练 IQ-OTH/NCCD**
+```bash
+python train.py \
+  --dataset-type iqothnccd \
+  --data-root "/workspace/data-lung/IQ-OTHNCCD Lung Cancer/The IQ-OTHNCCD lung cancer dataset/The IQ-OTHNCCD lung cancer dataset" \
+  --output-dir outputs/iqothnccd_resnet18 \
+  --model resnet18 \
+  --pretrained \
+  --epochs 50
+```
 
-1. 保持训练脚本 `train_ct.py` 不变，替换 `--data-root` 指向内网 CT 数据。
+**训练 LUNA16**
+```bash
+# 1. 先提取切片
+python prepare_luna16_slices.py \
+  --luna16-root /workspace/data-lung/luna16 \
+  --output-dir /workspace/data-lung/luna16/extracted_slices \
+  --subsets 0,1,2 \
+  --slices-per-series 20
+
+# 2. 再训练
+python train.py \
+  --dataset-type luna16 \
+  --data-root /workspace/data-lung/luna16/extracted_slices \
+  --output-dir outputs/luna16_resnet18 \
+  --model resnet18 \
+  --pretrained \
+  --epochs 30
+```
+
+## 5. 统一参数说明
+
+两个数据集使用**完全相同**的训练参数：
+
+| 参数 | 说明 | 默认值 |
+|------|------|---------|
+| `--dataset-type` | 数据集类型：`iqothnccd` 或 `luna16` | 必填 |
+| `--data-root` | 数据集根目录 | 必填 |
+| `--output-dir` | 输出目录 | 必填 |
+| `--image-size` | 输入图像尺寸 | 224 |
+| `--epochs` | 训练轮数 | 10 |
+| `--batch-size` | 批次大小 | 16 |
+| `--lr` | 学习率 | 1e-3 |
+| `--weight-decay` | 权重衰减 | 1e-4 |
+| `--train-ratio` | 训练集比例（剩余平分验证/测试） | 0.8 |
+| `--model` | 模型：`simple` 或 `resnet18` | simple |
+| `--pretrained` | 使用 ImageNet 预训练（仅 resnet18） | False |
+| `--cpu` | 强制使用 CPU | False |
+| `--seed` | 随机种子 | 42 |
+
+## 6. 训练结果
+
+### IQ-OTH/NCCD 训练结果（ResNet18，5 轮）
+
+```
+数据集类型: IQ_OTHNCCD
+数据根目录: /workspace/data-lung/IQ-OTHNCCD Lung Cancer/The IQ-OTHNCCD lung cancer dataset/The IQ-OTHNCCD lung cancer dataset
+输出目录: outputs/iqothnccd_resnet18
+
+找到 1097 个样本
+类别分布:
+  normal (label=0): 416
+  benign (label=1): 120
+  malignant (label=2): 561
+
+数据划分: train=876, val=110, test=111
+
+模型: resnet18 (pretrained=True)
+
+开始训练（共 5 轮）
+------------------------------------------------------------
+[Epoch 1/5] train_loss=0.5174 val_loss=2.1090 val_acc=0.2818
+[Epoch 2/5] train_loss=0.3060 val_loss=2.5552 val_acc=0.6000
+[Epoch 3/5] train_loss=0.3961 val_loss=5.2217 val_acc=0.4091
+[Epoch 4/5] train_loss=0.3154 val_loss=0.2561 val_acc=0.8818
+[Epoch 5/5] train_loss=0.2934 val_loss=5.5950 val_acc=0.5364
+
+在测试集上评估最佳模型...
+测试结果: loss=0.3048, acc=0.9009
+
+最佳验证准确率: 0.8818
+测试准确率: 0.9009
+```
+
+## 7. 与旧代码关系
+
+仓库原有多模态脚本保留；本次重构为统一训练框架，确保不同数据集的训练过程一致，方便对比和分析。
+
+## 8. 迁移到内网建议
+
+1. 保持训练脚本 `train.py` 不变，替换 `--data-root` 指向内网 CT 数据。
 2. 先对齐标签映射到 `normal/benign/malignant`。
 3. 如需提升精度，优先尝试：
    - 更强 backbone（如 EfficientNet/ConvNeXt）
    - 更长训练与学习率调度
    - class-balanced sampler / focal loss
    - 2.5D 或 3D 输入（按你们内网 CT 数据形态升级）
-
-## 6. 与旧代码关系
-
-仓库原有多模态脚本保留；本次新增了清晰的 CT-only 训练入口，作为后续多模态整合前的稳定基线。

@@ -20,7 +20,12 @@ from lung_cancer_cls.dataset import (
     create_dataset,
     get_default_transforms,
 )
-from lung_cancer_cls.model import SimpleCTClassifier, ResNet18CTClassifier
+from lung_cancer_cls.model import build_model
+from lung_cancer_cls.training_components import (
+    create_loss,
+    create_optimizer,
+    create_scheduler,
+)
 
 
 @dataclass
@@ -40,9 +45,17 @@ class TrainConfig:
     cpu: bool = False
     model: str = "simple"
     pretrained: bool = False
+    aug_profile: str = "basic"
+    loss_name: str = "ce"
+    label_smoothing: float = 0.0
+    focal_gamma: float = 2.0
+    optimizer_name: str = "adamw"
+    scheduler_name: str = "none"
     metadata_csv: Path | None = None
     ct_root: Path | None = None
     use_predefined_split: bool = False
+    use_3d_input: bool = False
+    depth_size: int = 32
 
 
 def set_seed(seed: int) -> None:
@@ -150,7 +163,9 @@ def train_epoch(
     loader: DataLoader,
     device: torch.device,
     criterion: nn.Module,
-    optimizer: torch.optim.Optimizer
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any = None,
+    scheduler_step_per_batch: bool = False,
 ) -> float:
     """统一的单轮训练函数"""
     model.train()
@@ -164,6 +179,8 @@ def train_epoch(
         loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
+        if scheduler is not None and scheduler_step_per_batch:
+            scheduler.step()
         running_loss += loss.item() * y.size(0)
         seen += y.size(0)
 
@@ -237,7 +254,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     # 3. 获取数据增强
     train_tf, val_test_tf = get_default_transforms(
-        config.dataset_type, config.image_size
+        config.dataset_type, config.image_size, aug_profile=config.aug_profile
     )
 
     # 4. 创建 DataLoader
@@ -246,19 +263,49 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 先获取样本列表，然后创建带 transform 的数据集
     from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, IntranetCTDataset
 
+    use_3d = config.use_3d_input or config.model == "resnet3d18"
+
     if config.dataset_type == DatasetType.IQ_OTHNCCD:
+        if use_3d:
+            raise ValueError("IQ-OTH/NCCD 是 2D 数据，不能使用 3D 输入模式")
         train_ds = Subset(IQOTHNCCDDataset(samples, transform=train_tf), train_idx)
         val_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), val_idx)
         test_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), test_idx)
     else:
         if config.dataset_type == DatasetType.LUNA16:
+            if use_3d:
+                raise ValueError("当前 LUNA16 流程使用 2D 切片，不能使用 3D 输入模式")
             train_ds = Subset(LUNA16Dataset(samples, transform=train_tf), train_idx)
             val_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), val_idx)
             test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
         else:
-            train_ds = Subset(IntranetCTDataset(samples, transform=train_tf), train_idx)
-            val_ds = Subset(IntranetCTDataset(samples, transform=val_test_tf), val_idx)
-            test_ds = Subset(IntranetCTDataset(samples, transform=val_test_tf), test_idx)
+            train_ds = Subset(
+                IntranetCTDataset(
+                    samples,
+                    transform=None if use_3d else train_tf,
+                    use_3d=use_3d,
+                    depth_size=config.depth_size,
+                ),
+                train_idx,
+            )
+            val_ds = Subset(
+                IntranetCTDataset(
+                    samples,
+                    transform=None if use_3d else val_test_tf,
+                    use_3d=use_3d,
+                    depth_size=config.depth_size,
+                ),
+                val_idx,
+            )
+            test_ds = Subset(
+                IntranetCTDataset(
+                    samples,
+                    transform=None if use_3d else val_test_tf,
+                    use_3d=use_3d,
+                    depth_size=config.depth_size,
+                ),
+                test_idx,
+            )
 
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
@@ -275,17 +322,29 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     # 5. 创建模型
     print(f"\n模型: {config.model} (pretrained={config.pretrained})")
-    if config.model == "resnet18":
-        model = ResNet18CTClassifier(
-            num_classes=3, pretrained=config.pretrained
-        ).to(device)
-    else:
-        model = SimpleCTClassifier(num_classes=3).to(device)
+    model = build_model(
+        config.model,
+        num_classes=3,
+        pretrained=config.pretrained,
+    ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    optimizer = create_optimizer(
+        config.optimizer_name,
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
     )
-    criterion = nn.CrossEntropyLoss()
+    criterion = create_loss(
+        config.loss_name,
+        label_smoothing=config.label_smoothing,
+        focal_gamma=config.focal_gamma,
+    )
+    scheduler, scheduler_step_per_batch = create_scheduler(
+        config.scheduler_name,
+        optimizer,
+        epochs=config.epochs,
+        steps_per_epoch=len(train_loader),
+    )
 
     # 6. 准备输出目录
     out_dir = config.output_dir
@@ -299,8 +358,22 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print("-" * 60)
 
     for epoch in range(1, config.epochs + 1):
-        train_loss = train_epoch(model, train_loader, device, criterion, optimizer)
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            device,
+            criterion,
+            optimizer,
+            scheduler=scheduler,
+            scheduler_step_per_batch=scheduler_step_per_batch,
+        )
         val_loss, val_acc = evaluate(model, val_loader, device, criterion)
+
+        if scheduler is not None and not scheduler_step_per_batch:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_acc)
+            else:
+                scheduler.step()
 
         history.append({
             "epoch": epoch,
@@ -312,7 +385,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         print(f"[Epoch {epoch}/{config.epochs}] "
               f"train_loss={train_loss:.4f} "
               f"val_loss={val_loss:.4f} "
-              f"val_acc={val_acc:.4f}")
+              f"val_acc={val_acc:.4f} "
+              f"lr={optimizer.param_groups[0]['lr']:.6f}")
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
@@ -419,13 +493,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="强制使用 CPU (即使有 GPU)"
     )
     parser.add_argument(
-        "--model", type=str, choices=["simple", "resnet18"],
+        "--model", type=str, choices=[
+            "simple",
+            "resnet18",
+            "resnet18_se",
+            "resnet18_cbam",
+            "efficientnet_b0",
+            "convnext_tiny",
+            "resnet3d18",
+        ],
         default="simple", help="模型架构 (默认: simple)"
     )
     parser.add_argument(
         "--pretrained", action="store_true",
         help="使用 ImageNet 预训练权重 (仅对 resnet18 有效)"
     )
+    parser.add_argument(
+        "--aug-profile", type=str, choices=["basic", "strong"], default="basic",
+        help="数据增强配置：basic / strong"
+    )
+    parser.add_argument(
+        "--loss", type=str, choices=["ce", "focal"], default="ce",
+        help="损失函数：ce / focal"
+    )
+    parser.add_argument(
+        "--label-smoothing", type=float, default=0.0,
+        help="CE 标签平滑，仅 loss=ce 时有效"
+    )
+    parser.add_argument(
+        "--focal-gamma", type=float, default=2.0,
+        help="Focal Loss gamma，仅 loss=focal 时有效"
+    )
+    parser.add_argument(
+        "--optimizer", type=str, choices=["adamw", "sgd"], default="adamw",
+        help="优化器：adamw / sgd"
+    )
+    parser.add_argument(
+        "--scheduler", type=str, choices=["none", "cosine", "onecycle", "plateau"], default="none",
+        help="学习率调度器"
+    )
+    parser.add_argument("--use-3d-input", action="store_true", help="启用 3D 体输入（仅内网 .npy）")
+    parser.add_argument("--depth-size", type=int, default=32, help="3D 输入重采样深度")
 
     return parser
 
@@ -460,6 +568,14 @@ def main():
         cpu=args.cpu,
         model=args.model,
         pretrained=args.pretrained,
+        aug_profile=args.aug_profile,
+        loss_name=args.loss,
+        label_smoothing=args.label_smoothing,
+        focal_gamma=args.focal_gamma,
+        optimizer_name=args.optimizer,
+        scheduler_name=args.scheduler,
+        use_3d_input=args.use_3d_input,
+        depth_size=args.depth_size,
         metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
         ct_root=Path(args.ct_root) if args.ct_root else None,
         use_predefined_split=args.use_predefined_split,

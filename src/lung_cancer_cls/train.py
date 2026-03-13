@@ -541,7 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pretrained", action="store_true",
-        help="使用 ImageNet 预训练权重 (仅对 resnet18 有效)"
+        help="使用预训练权重（2D 使用 ImageNet，resnet3d18 使用 Kinetics400）"
     )
     parser.add_argument(
         "--aug-profile", type=str, choices=["basic", "strong"], default="basic",

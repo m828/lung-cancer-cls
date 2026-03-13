@@ -97,11 +97,11 @@ python train.py \
 
 ## 5. 统一参数说明
 
-两个数据集使用**完全相同**的训练参数：
+公开数据与内网数据使用同一套训练入口，核心参数可保持一致：
 
 | 参数 | 说明 | 默认值 |
 |------|------|---------|
-| `--dataset-type` | 数据集类型：`iqothnccd` 或 `luna16` | 必填 |
+| `--dataset-type` | 数据集类型：`iqothnccd` / `luna16` / `intranet_ct` | 必填 |
 | `--data-root` | 数据集根目录 | 必填 |
 | `--output-dir` | 输出目录 | 必填 |
 | `--image-size` | 输入图像尺寸 | 224 |
@@ -110,8 +110,14 @@ python train.py \
 | `--lr` | 学习率 | 1e-3 |
 | `--weight-decay` | 权重衰减 | 1e-4 |
 | `--train-ratio` | 训练集比例（剩余平分验证/测试） | 0.8 |
-| `--model` | 模型：`simple` 或 `resnet18` | simple |
-| `--pretrained` | 使用 ImageNet 预训练（仅 resnet18） | False |
+| `--model` | 模型：`simple`/`resnet18`/`resnet18_se`/`resnet18_cbam`/`efficientnet_b0`/`convnext_tiny`/`resnet3d18` | simple |
+| `--pretrained` | 使用预训练（对 2D ImageNet 与 3D Kinetics400 模型生效） | False |
+| `--aug-profile` | 数据增强：`basic` / `strong` | basic |
+| `--loss` | 损失：`ce` / `focal` | ce |
+| `--label-smoothing` | CE 标签平滑 | 0.0 |
+| `--focal-gamma` | Focal Loss gamma | 2.0 |
+| `--optimizer` | 优化器：`adamw` / `sgd` | adamw |
+| `--scheduler` | 调度器：`none` / `cosine` / `onecycle` / `plateau` | none |
 | `--sampling-strategy` | 采样策略：`default` / `weighted` | default |
 | `--class-weight-strategy` | 类别权重：`none`/`inverse`/`sqrt_inverse`/`effective_num` | none |
 | `--effective-num-beta` | `effective_num` 权重的 beta | 0.999 |
@@ -125,6 +131,8 @@ python train.py \
 | `--metadata-csv` | 内网索引表 CSV 路径 | `data-root/多模态统一检索表_CT本地路径_CT划分.csv` |
 | `--ct-root` | CT `.npy` 根目录 | `data-root` |
 | `--use-predefined-split` | 使用 CSV 中的 `train/val/test` 划分 | False |
+| `--use-3d-input` | 启用 3D 体输入（仅内网 `.npy`） | False |
+| `--depth-size` | 3D 输入重采样深度 | 32 |
 
 示例：
 

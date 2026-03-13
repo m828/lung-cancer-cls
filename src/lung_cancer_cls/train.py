@@ -11,7 +11,7 @@ from typing import Dict, List, Sequence, Tuple, Any
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from lung_cancer_cls.dataset import (
     DatasetType,
@@ -22,6 +22,7 @@ from lung_cancer_cls.dataset import (
 )
 from lung_cancer_cls.model import build_model
 from lung_cancer_cls.training_components import (
+    build_class_weights,
     create_loss,
     create_optimizer,
     create_scheduler,
@@ -51,6 +52,9 @@ class TrainConfig:
     focal_gamma: float = 2.0
     optimizer_name: str = "adamw"
     scheduler_name: str = "none"
+    sampling_strategy: str = "default"
+    class_weight_strategy: str = "none"
+    effective_num_beta: float = 0.999
     metadata_csv: Path | None = None
     ct_root: Path | None = None
     use_predefined_split: bool = False
@@ -311,6 +315,27 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         train_ds, batch_size=config.batch_size,
         shuffle=True, num_workers=config.num_workers
     )
+
+    # 数据不平衡处理：可选加权采样
+    train_label_counts = [0, 0, 0]
+    for i in train_idx:
+        train_label_counts[samples[i].label] += 1
+
+    if config.sampling_strategy == "weighted":
+        per_class_weights = [1.0 / max(1, c) for c in train_label_counts]
+        sample_weights = [per_class_weights[samples[i].label] for i in train_idx]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=config.num_workers,
+        )
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
         shuffle=False, num_workers=config.num_workers
@@ -322,6 +347,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     # 5. 创建模型
     print(f"\n模型: {config.model} (pretrained={config.pretrained})")
+    print(f"训练集类别计数: normal={train_label_counts[0]}, benign={train_label_counts[1]}, malignant={train_label_counts[2]}")
+    print(f"不平衡策略: sampler={config.sampling_strategy}, class_weight={config.class_weight_strategy}")
     model = build_model(
         config.model,
         num_classes=3,
@@ -338,7 +365,12 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         config.loss_name,
         label_smoothing=config.label_smoothing,
         focal_gamma=config.focal_gamma,
-    )
+        class_weights=build_class_weights(
+            train_label_counts,
+            strategy=config.class_weight_strategy,
+            effective_num_beta=config.effective_num_beta,
+        ),
+    ).to(device)
     scheduler, scheduler_step_per_batch = create_scheduler(
         config.scheduler_name,
         optimizer,
@@ -413,6 +445,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "epochs": config.epochs,
             "model": config.model,
             "pretrained": config.pretrained,
+            "sampling_strategy": config.sampling_strategy,
+            "class_weight_strategy": config.class_weight_strategy,
+            "effective_num_beta": config.effective_num_beta,
         }
     }
 
@@ -532,6 +567,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--scheduler", type=str, choices=["none", "cosine", "onecycle", "plateau"], default="none",
         help="学习率调度器"
     )
+    parser.add_argument(
+        "--sampling-strategy", type=str, choices=["default", "weighted"], default="default",
+        help="训练采样策略：default / weighted（类别不平衡时推荐）"
+    )
+    parser.add_argument(
+        "--class-weight-strategy", type=str,
+        choices=["none", "inverse", "sqrt_inverse", "effective_num"], default="none",
+        help="损失函数类别权重策略"
+    )
+    parser.add_argument(
+        "--effective-num-beta", type=float, default=0.999,
+        help="effective_num 权重的 beta 参数"
+    )
     parser.add_argument("--use-3d-input", action="store_true", help="启用 3D 体输入（仅内网 .npy）")
     parser.add_argument("--depth-size", type=int, default=32, help="3D 输入重采样深度")
 
@@ -574,6 +622,9 @@ def main():
         focal_gamma=args.focal_gamma,
         optimizer_name=args.optimizer,
         scheduler_name=args.scheduler,
+        sampling_strategy=args.sampling_strategy,
+        class_weight_strategy=args.class_weight_strategy,
+        effective_num_beta=args.effective_num_beta,
         use_3d_input=args.use_3d_input,
         depth_size=args.depth_size,
         metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,

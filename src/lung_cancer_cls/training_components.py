@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Iterable, Sequence
 from typing import Iterable
 
 import torch
@@ -11,10 +12,15 @@ from torch import nn
 class FocalLoss(nn.Module):
     """多分类 Focal Loss，适合类别不均衡。"""
 
-    def __init__(self, gamma: float = 2.0, alpha: float | None = None):
+    def __init__(self, gamma: float = 2.0, alpha: torch.Tensor | float | None = None):
         super().__init__()
         self.gamma = gamma
-        self.alpha = alpha
+        if isinstance(alpha, torch.Tensor):
+            self.register_buffer("alpha", alpha.float())
+        elif alpha is not None:
+            self.register_buffer("alpha", torch.tensor(float(alpha), dtype=torch.float32))
+        else:
+            self.alpha = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         log_probs = F.log_softmax(logits, dim=1)
@@ -28,17 +34,51 @@ class FocalLoss(nn.Module):
         loss = -focal_factor * target_log_probs
 
         if self.alpha is not None:
-            loss = self.alpha * loss
+            if self.alpha.ndim == 0:
+                loss = self.alpha * loss
+            else:
+                loss = self.alpha[targets] * loss
 
         return loss.mean()
 
 
-def create_loss(loss_name: str, label_smoothing: float = 0.0, focal_gamma: float = 2.0) -> nn.Module:
+def build_class_weights(
+    counts: Sequence[int],
+    strategy: str = "none",
+    effective_num_beta: float = 0.999,
+) -> torch.Tensor | None:
+    name = strategy.lower().strip()
+    if name == "none":
+        return None
+
+    counts_t = torch.tensor([max(1, int(c)) for c in counts], dtype=torch.float32)
+
+    if name == "inverse":
+        weights = 1.0 / counts_t
+    elif name == "sqrt_inverse":
+        weights = 1.0 / torch.sqrt(counts_t)
+    elif name == "effective_num":
+        beta = min(max(effective_num_beta, 0.0), 0.99999)
+        effective_num = 1.0 - torch.pow(torch.tensor(beta), counts_t)
+        weights = (1.0 - beta) / effective_num
+    else:
+        raise ValueError(f"Unknown class weight strategy: {strategy}")
+
+    weights = weights / weights.sum() * len(counts)
+    return weights
+
+
+def create_loss(
+    loss_name: str,
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 2.0,
+    class_weights: torch.Tensor | None = None,
+) -> nn.Module:
     name = loss_name.lower().strip()
     if name == "ce":
-        return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     if name == "focal":
-        return FocalLoss(gamma=focal_gamma)
+        return FocalLoss(gamma=focal_gamma, alpha=class_weights)
     raise ValueError(f"Unknown loss: {loss_name}")
 
 

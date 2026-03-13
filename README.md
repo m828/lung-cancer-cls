@@ -112,6 +112,9 @@ python train.py \
 | `--train-ratio` | 训练集比例（剩余平分验证/测试） | 0.8 |
 | `--model` | 模型：`simple` 或 `resnet18` | simple |
 | `--pretrained` | 使用 ImageNet 预训练（仅 resnet18） | False |
+| `--sampling-strategy` | 采样策略：`default` / `weighted` | default |
+| `--class-weight-strategy` | 类别权重：`none`/`inverse`/`sqrt_inverse`/`effective_num` | none |
+| `--effective-num-beta` | `effective_num` 权重的 beta | 0.999 |
 | `--cpu` | 强制使用 CPU | False |
 | `--seed` | 随机种子 | 42 |
 
@@ -212,6 +215,22 @@ python train.py \
 - 优化器 `--optimizer`：`adamw` / `sgd`
 - 调度器 `--scheduler`：`none` / `cosine` / `onecycle` / `plateau`
 
+### 类别不平衡专项（LUNA16 / 内网重点推荐）
+
+- 采样侧：`--sampling-strategy weighted`
+  - 使用 `WeightedRandomSampler` 对少数类（如良性）进行过采样。
+- 损失侧：`--class-weight-strategy`
+  - `inverse`：按类别频次反比加权
+  - `sqrt_inverse`：按频次开方反比加权（更稳）
+  - `effective_num`：Class-Balanced Loss 常用权重，配合 `--effective-num-beta`（默认 `0.999`）
+- 与损失结合：
+  - `--loss ce --class-weight-strategy effective_num`
+  - 或 `--loss focal --focal-gamma 2.0 --class-weight-strategy inverse`
+
+建议从这两组起步：
+1. **稳健方案**：`weighted sampler + CE(label smoothing=0.05) + effective_num`
+2. **强化少数类召回**：`weighted sampler + focal(gamma=2.0) + inverse`
+
 ### 3D 输入（内网 `.npy`）
 
 - `--use-3d-input`：启用 3D 模式
@@ -253,5 +272,20 @@ python train.py \
   --model resnet3d18 --pretrained \
   --use-3d-input --depth-size 32 \
   --optimizer sgd --lr 5e-3 --weight-decay 1e-4 \
+  --scheduler cosine
+
+# 不平衡重点：良性样本较少时（例如 1500 例中良性 ~100）
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /path/to/root \
+  --metadata-csv /path/to/meta.csv \
+  --ct-root /path/to/ct_npy \
+  --output-dir outputs/intranet_imbalance_recipe \
+  --model resnet18_cbam --pretrained \
+  --aug-profile strong \
+  --sampling-strategy weighted \
+  --loss ce --label-smoothing 0.05 \
+  --class-weight-strategy effective_num --effective-num-beta 0.999 \
+  --optimizer adamw --lr 3e-4 --weight-decay 1e-4 \
   --scheduler cosine
 ```

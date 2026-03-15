@@ -79,6 +79,111 @@ def canonicalize_class_name(name: str) -> str | None:
     return ALIASES.get(name.strip().lower())
 
 
+class DataGenerator(Dataset):
+    """Mask-aware 数据读取器（借鉴 Subregion-Unet 的 txt 配置方式）。
+
+    txt 每行支持以下格式之一：
+    1) `mask_path image_path label`
+    2) `mask_path image_path`（标签从 image_path 父目录名推断）
+    """
+
+    def __init__(
+        self,
+        txtpath: str | Path,
+        image_transform: Callable | None = None,
+        mask_transform: Callable | None = None,
+    ):
+        self.datatxtpath = Path(txtpath)
+        self.image_transform = image_transform
+        self.mask_transform = mask_transform
+        self.samples = self.read_txt()
+
+    def read_txt(self) -> List[Sample]:
+        samples: List[Sample] = []
+        if not self.datatxtpath.exists():
+            raise FileNotFoundError(f"Mask txt not found: {self.datatxtpath}")
+
+        with open(self.datatxtpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+
+                mask_path = Path(parts[0])
+                image_path = Path(parts[1])
+
+                if len(parts) >= 3:
+                    label_token = parts[2].strip().lower()
+                    if label_token.isdigit():
+                        label = int(label_token)
+                    else:
+                        canonical = canonicalize_class_name(label_token)
+                        if canonical is None:
+                            continue
+                        label = CLASS_NAME_TO_ID[canonical]
+                else:
+                    canonical = canonicalize_class_name(image_path.parent.name)
+                    if canonical is None:
+                        continue
+                    label = CLASS_NAME_TO_ID[canonical]
+
+                if not image_path.exists() or not mask_path.exists():
+                    continue
+
+                samples.append(
+                    Sample(
+                        image_path=image_path,
+                        label=label,
+                        metadata={"mask_path": str(mask_path)},
+                    )
+                )
+
+        if not samples:
+            raise RuntimeError("No valid mask-aware samples parsed from txt")
+        return samples
+
+    def get_samples(self) -> List[Sample]:
+        return self.samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        sample = self.samples[idx]
+        mask_path = Path(sample.metadata["mask_path"]) if sample.metadata else None
+        if mask_path is None:
+            raise ValueError("Mask path missing in sample metadata")
+
+        img = Image.open(sample.image_path).convert("L")
+        mask = Image.open(mask_path).convert("L")
+
+        mask_arr = np.array(mask)
+        mask_arr[mask_arr != 0] = 255
+        mask = Image.fromarray(mask_arr.astype(np.uint8))
+
+        if self.image_transform is not None:
+            img = self.image_transform(img)
+        else:
+            from torchvision import transforms
+
+            img = transforms.ToTensor()(img)
+
+        if self.mask_transform is not None:
+            mask = self.mask_transform(mask)
+        else:
+            from torchvision import transforms
+
+            mask = transforms.ToTensor()(mask)
+
+        if isinstance(mask, torch.Tensor):
+            mask = (mask > 0.5).float()
+
+        return img, sample.label, mask
+
+
 # ======================================
 # IQ-OTH/NCCD 数据集
 # ======================================
@@ -257,9 +362,17 @@ INTRANET_LABEL_MAP: Dict[str, int] = {
 class IntranetCTDataset(BaseCTDataset):
     """内网 CT 三分类数据集（基于索引表读取 .npy）"""
 
-    def __init__(self, samples: Sequence[Sample], transform: Callable | None = None):
+    def __init__(
+        self,
+        samples: Sequence[Sample],
+        transform: Callable | None = None,
+        use_3d: bool = False,
+        depth_size: int = 32,
+    ):
         self.samples = list(samples)
         self.transform = transform
+        self.use_3d = use_3d
+        self.depth_size = depth_size
 
     def get_samples(self) -> List[Sample]:
         return self.samples
@@ -327,6 +440,27 @@ class IntranetCTDataset(BaseCTDataset):
         sample = self.samples[idx]
         arr = np.load(sample.image_path).astype(np.float32)
 
+        if self.use_3d:
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise ValueError(f"Unsupported CT array shape for 3D mode: {arr.shape}, path={sample.image_path}")
+
+            arr = arr - arr.min()
+            max_val = arr.max()
+            if max_val > 0:
+                arr = arr / max_val
+
+            tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.depth_size, 128, 128),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, sample.label
+
         # 兼容 3D 体数据：取中间层作为 2D 输入
         if arr.ndim == 3:
             arr = arr[arr.shape[0] // 2]
@@ -362,9 +496,35 @@ def create_dataset(dataset_type: DatasetType, root: Path, **kwargs) -> BaseCTDat
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
 
-def get_default_transforms(dataset_type: DatasetType, image_size: int = 224):
-    """获取指定数据集类型的默认数据增强"""
+def get_default_transforms(
+    dataset_type: DatasetType,
+    image_size: int = 224,
+    aug_profile: str = "basic",
+):
+    """获取指定数据集类型的数据增强（可切换 profile 便于消融）。"""
     from torchvision import transforms
+
+    profile = aug_profile.lower().strip()
+
+    if profile == "strong":
+        train_tf = transforms.Compose([
+            transforms.Resize((image_size + 16, image_size + 16)),
+            transforms.RandomResizedCrop(image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomAffine(degrees=12, translate=(0.06, 0.06), scale=(0.9, 1.1)),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
+            transforms.RandomAdjustSharpness(sharpness_factor=1.8, p=0.2),
+            transforms.ToTensor(),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        val_test_tf = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        return train_tf, val_test_tf
 
     if dataset_type == DatasetType.IQ_OTHNCCD:
         train_tf = transforms.Compose([

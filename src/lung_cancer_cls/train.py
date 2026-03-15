@@ -320,7 +320,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 先获取样本列表，然后创建带 transform 的数据集
     from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, IntranetCTDataset
 
-    use_3d = config.use_3d_input or config.model == "resnet3d18"
+    auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "attention3d_cnn"}
+    use_3d = config.use_3d_input or config.model in auto_3d_models
 
     test_ds = None
     if config.dataset_type == DatasetType.IQ_OTHNCCD:
@@ -607,12 +608,17 @@ def build_parser() -> argparse.ArgumentParser:
             "efficientnet_b0",
             "convnext_tiny",
             "resnet3d18",
+            "mc3_18",
+            "r2plus1d_18",
+            "swin3d_tiny",
+            "densenet3d",
+            "attention3d_cnn",
         ],
         default="simple", help="模型架构 (默认: simple)"
     )
     parser.add_argument(
         "--pretrained", action="store_true",
-        help="使用预训练权重（2D 使用 ImageNet，resnet3d18 使用 Kinetics400）"
+        help="使用预训练权重（2D 使用 ImageNet，3D 视频模型使用 Kinetics400）"
     )
     parser.add_argument(
         "--aug-profile", type=str, choices=["basic", "strong"], default="basic",

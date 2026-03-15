@@ -57,6 +57,89 @@ class CBAMBlock(nn.Module):
         return self.spatial(x)
 
 
+class SEModule3D(nn.Module):
+    """3D Squeeze-and-Excitation 通道注意力。"""
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        reduced = max(channels // reduction, 8)
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, reduced),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _, _ = x.shape
+        weights = self.pool(x).view(b, c)
+        weights = self.fc(weights).view(b, c, 1, 1, 1)
+        return x * weights
+
+
+class Attention3DCNNClassifier(nn.Module):
+    """轻量 Attention 3D CNN（DeepLung 风格模块化替代）。"""
+
+    def __init__(self, num_classes: int = 3):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
+            nn.Conv3d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+            SEModule3D(64),
+            nn.MaxPool3d(2),
+            nn.Conv3d(64, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+            SEModule3D(128),
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+        )
+        self.classifier = nn.Linear(128, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x).flatten(1)
+        return self.classifier(x)
+
+
+def _adapt_video_stem_to_single_channel(net: nn.Module, pretrained: bool) -> nn.Module:
+    """将 torchvision.video 网络 stem 第一层改为单通道。"""
+    original_conv = net.stem[0]
+    net.stem[0] = nn.Conv3d(
+        1,
+        original_conv.out_channels,
+        kernel_size=original_conv.kernel_size,
+        stride=original_conv.stride,
+        padding=original_conv.padding,
+        bias=original_conv.bias is not None,
+    )
+    if pretrained:
+        with torch.no_grad():
+            net.stem[0].weight.copy_(original_conv.weight.mean(dim=1, keepdim=True))
+    return net
+
+
+def _adapt_swin3d_patch_embed_to_single_channel(net: nn.Module, pretrained: bool) -> nn.Module:
+    """将 Swin3D patch embedding 改为单通道。"""
+    original_conv = net.patch_embed.proj
+    net.patch_embed.proj = nn.Conv3d(
+        1,
+        original_conv.out_channels,
+        kernel_size=original_conv.kernel_size,
+        stride=original_conv.stride,
+        padding=original_conv.padding,
+        bias=original_conv.bias is not None,
+    )
+    if pretrained:
+        with torch.no_grad():
+            net.patch_embed.proj.weight.copy_(original_conv.weight.mean(dim=1, keepdim=True))
+    return net
+
+
 class SimpleCTClassifier(nn.Module):
     """A lightweight 2D CNN baseline for CT slice classification."""
 
@@ -132,7 +215,7 @@ class ResNet18CTClassifier(nn.Module):
             kernel_size=original_conv1.kernel_size,
             stride=original_conv1.stride,
             padding=original_conv1.padding,
-            bias=original_conv1.bias,
+            bias=original_conv1.bias is not None,
         )
 
         if pretrained:
@@ -161,7 +244,7 @@ class EfficientNetB0CTClassifier(nn.Module):
             kernel_size=original_conv.kernel_size,
             stride=original_conv.stride,
             padding=original_conv.padding,
-            bias=original_conv.bias,
+            bias=original_conv.bias is not None,
         )
         if pretrained:
             with torch.no_grad():
@@ -190,7 +273,7 @@ class ConvNeXtTinyCTClassifier(nn.Module):
             kernel_size=original_conv.kernel_size,
             stride=original_conv.stride,
             padding=original_conv.padding,
-            bias=original_conv.bias,
+            bias=original_conv.bias is not None,
         )
         if pretrained:
             with torch.no_grad():
@@ -212,24 +295,116 @@ class ResNet3D18CTClassifier(nn.Module):
         weights = models.video.R3D_18_Weights.KINETICS400_V1 if pretrained else None
         net = models.video.r3d_18(weights=weights)
 
-        original_conv = net.stem[0]
-        net.stem[0] = nn.Conv3d(
-            1,
-            original_conv.out_channels,
-            kernel_size=original_conv.kernel_size,
-            stride=original_conv.stride,
-            padding=original_conv.padding,
-            bias=original_conv.bias,
-        )
-        if pretrained:
-            with torch.no_grad():
-                net.stem[0].weight.copy_(original_conv.weight.mean(dim=1, keepdim=True))
+        net = _adapt_video_stem_to_single_channel(net, pretrained=pretrained)
 
         net.fc = nn.Linear(net.fc.in_features, num_classes)
         self.backbone = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
+
+
+class MC3_18CTClassifier(nn.Module):
+    """MC3-18：3D ResNet 变体。"""
+
+    def __init__(self, num_classes: int = 3, pretrained: bool = False):
+        super().__init__()
+        weights = models.video.MC3_18_Weights.KINETICS400_V1 if pretrained else None
+        net = models.video.mc3_18(weights=weights)
+        net = _adapt_video_stem_to_single_channel(net, pretrained=pretrained)
+        net.fc = nn.Linear(net.fc.in_features, num_classes)
+        self.backbone = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+
+class R2Plus1D18CTClassifier(nn.Module):
+    """R(2+1)D-18：时空解耦卷积，常用于医学 3D 迁移。"""
+
+    def __init__(self, num_classes: int = 3, pretrained: bool = False):
+        super().__init__()
+        weights = models.video.R2Plus1D_18_Weights.KINETICS400_V1 if pretrained else None
+        net = models.video.r2plus1d_18(weights=weights)
+        net = _adapt_video_stem_to_single_channel(net, pretrained=pretrained)
+        net.fc = nn.Linear(net.fc.in_features, num_classes)
+        self.backbone = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+
+class Swin3DTinyCTClassifier(nn.Module):
+    """Swin3D-Tiny（Video Swin Transformer）适配 CT 体数据。"""
+
+    def __init__(self, num_classes: int = 3, pretrained: bool = False):
+        super().__init__()
+        weights = models.video.Swin3D_T_Weights.KINETICS400_IMAGENET22K_V1 if pretrained else None
+        net = models.video.swin3d_t(weights=weights)
+        net = _adapt_swin3d_patch_embed_to_single_channel(net, pretrained=pretrained)
+        in_features = net.head.in_features
+        net.head = nn.Linear(in_features, num_classes)
+        self.backbone = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+
+class DenseNet3DCTClassifier(nn.Module):
+    """轻量 3D DenseNet（适合医学 CT 体数据的参数高效基线）。"""
+
+    def __init__(self, num_classes: int = 3, growth_rate: int = 16):
+        super().__init__()
+
+        def dense_block(in_ch: int, layers: int):
+            blocks = []
+            ch = in_ch
+            for _ in range(layers):
+                blocks.extend([
+                    nn.BatchNorm3d(ch),
+                    nn.ReLU(inplace=True),
+                    nn.Conv3d(ch, growth_rate, kernel_size=3, padding=1, bias=False),
+                ])
+                ch += growth_rate
+            return nn.Sequential(*blocks), ch
+
+        self.stem = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+        )
+
+        self.block1, ch1 = dense_block(32, 3)
+        self.trans1 = nn.Sequential(
+            nn.BatchNorm3d(ch1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(ch1, 64, kernel_size=1, bias=False),
+            nn.AvgPool3d(2),
+        )
+        self.block2, ch2 = dense_block(64, 3)
+        self.trans2 = nn.Sequential(
+            nn.BatchNorm3d(ch2),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(ch2, 128, kernel_size=1, bias=False),
+            nn.AvgPool3d(2),
+        )
+        self.block3, ch3 = dense_block(128, 3)
+        self.head = nn.Sequential(
+            nn.BatchNorm3d(ch3),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool3d((1, 1, 1)),
+        )
+        self.classifier = nn.Linear(ch3, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.block1(x)
+        x = self.trans1(x)
+        x = self.block2(x)
+        x = self.trans2(x)
+        x = self.block3(x)
+        x = self.head(x).flatten(1)
+        return self.classifier(x)
 
 
 def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False) -> nn.Module:
@@ -250,5 +425,15 @@ def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False)
         return ConvNeXtTinyCTClassifier(num_classes=num_classes, pretrained=pretrained)
     if name == "resnet3d18":
         return ResNet3D18CTClassifier(num_classes=num_classes, pretrained=pretrained)
+    if name == "mc3_18":
+        return MC3_18CTClassifier(num_classes=num_classes, pretrained=pretrained)
+    if name == "r2plus1d_18":
+        return R2Plus1D18CTClassifier(num_classes=num_classes, pretrained=pretrained)
+    if name == "swin3d_tiny":
+        return Swin3DTinyCTClassifier(num_classes=num_classes, pretrained=pretrained)
+    if name == "densenet3d":
+        return DenseNet3DCTClassifier(num_classes=num_classes)
+    if name == "attention3d_cnn":
+        return Attention3DCNNClassifier(num_classes=num_classes)
 
     raise ValueError(f"Unknown model: {model_name}")

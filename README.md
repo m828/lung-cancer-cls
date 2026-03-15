@@ -111,7 +111,7 @@ python train.py \
 | `--weight-decay` | 权重衰减 | 1e-4 |
 | `--train-ratio` | 训练集比例（剩余平分验证/测试） | 0.8 |
 | `--split-mode` | 划分模式：`train_val_test`（80/10/10）或 `train_val`（8/2，无测试集） | train_val_test |
-| `--model` | 模型：`simple`/`resnet18`/`resnet18_se`/`resnet18_cbam`/`efficientnet_b0`/`convnext_tiny`/`resnet3d18` | simple |
+| `--model` | 模型：`simple`/`resnet18`/`resnet18_se`/`resnet18_cbam`/`efficientnet_b0`/`convnext_tiny`/`resnet3d18`/`mc3_18`/`r2plus1d_18`/`swin3d_tiny`/`densenet3d`/`attention3d_cnn` | simple |
 | `--pretrained` | 使用预训练（对 2D ImageNet 与 3D Kinetics400 模型生效） | False |
 | `--aug-profile` | 数据增强：`basic` / `strong` | basic |
 | `--loss` | 损失：`ce` / `focal` | ce |
@@ -207,6 +207,11 @@ python train.py \
 - `efficientnet_b0`：小样本常见高性价比 backbone
 - `convnext_tiny`：近两年常用强基线
 - `resnet3d18`：3D CT 体数据模型（`[B,1,D,H,W]`）
+- `mc3_18`：3D ResNet 变体（Kinetics 预训练可用）
+- `r2plus1d_18`：R(2+1)D 3D 时空解耦卷积
+- `swin3d_tiny`：Video Swin Transformer（3D Transformer 强基线）
+- `densenet3d`：轻量 3D DenseNet（参数高效）
+- `attention3d_cnn`：Attention 3D CNN（SE 注意力）
 
 ### 数据增强（`--aug-profile`）
 

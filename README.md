@@ -152,7 +152,7 @@ python train.py \
 
 ## 6. 训练结果
 
-### IQ-OTH/NCCD 训练结果（ResNet18，5 轮）
+### IQ-OTH/NCCD 训练结果（ResNet18，50 轮）
 
 ```
 数据集类型: IQ_OTHNCCD
@@ -169,19 +169,17 @@ python train.py \
 
 模型: resnet18 (pretrained=True)
 
-开始训练（共 5 轮）
-------------------------------------------------------------
-[Epoch 1/5] train_loss=0.5174 val_loss=2.1090 val_acc=0.2818
-[Epoch 2/5] train_loss=0.3060 val_loss=2.5552 val_acc=0.6000
-[Epoch 3/5] train_loss=0.3961 val_loss=5.2217 val_acc=0.4091
-[Epoch 4/5] train_loss=0.3154 val_loss=0.2561 val_acc=0.8818
-[Epoch 5/5] train_loss=0.2934 val_loss=5.5950 val_acc=0.5364
+最佳验证准确率: 1.0
+测试准确率: 0.982
+```
 
-在测试集上评估最佳模型...
-测试结果: loss=0.3048, acc=0.9009
+### LUNA16 训练结果（ResNet18，50 轮）
 
-最佳验证准确率: 0.8818
-测试准确率: 0.9009
+```
+模型: resnet18 (pretrained=True)
+
+最佳验证准确率: 0.991
+测试准确率: 0.989
 ```
 
 ## 7. 与旧代码关系

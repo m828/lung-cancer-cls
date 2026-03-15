@@ -257,9 +257,17 @@ INTRANET_LABEL_MAP: Dict[str, int] = {
 class IntranetCTDataset(BaseCTDataset):
     """内网 CT 三分类数据集（基于索引表读取 .npy）"""
 
-    def __init__(self, samples: Sequence[Sample], transform: Callable | None = None):
+    def __init__(
+        self,
+        samples: Sequence[Sample],
+        transform: Callable | None = None,
+        use_3d: bool = False,
+        depth_size: int = 32,
+    ):
         self.samples = list(samples)
         self.transform = transform
+        self.use_3d = use_3d
+        self.depth_size = depth_size
 
     def get_samples(self) -> List[Sample]:
         return self.samples
@@ -327,6 +335,27 @@ class IntranetCTDataset(BaseCTDataset):
         sample = self.samples[idx]
         arr = np.load(sample.image_path).astype(np.float32)
 
+        if self.use_3d:
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise ValueError(f"Unsupported CT array shape for 3D mode: {arr.shape}, path={sample.image_path}")
+
+            arr = arr - arr.min()
+            max_val = arr.max()
+            if max_val > 0:
+                arr = arr / max_val
+
+            tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.depth_size, 128, 128),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, sample.label
+
         # 兼容 3D 体数据：取中间层作为 2D 输入
         if arr.ndim == 3:
             arr = arr[arr.shape[0] // 2]
@@ -362,9 +391,35 @@ def create_dataset(dataset_type: DatasetType, root: Path, **kwargs) -> BaseCTDat
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
 
-def get_default_transforms(dataset_type: DatasetType, image_size: int = 224):
-    """获取指定数据集类型的默认数据增强"""
+def get_default_transforms(
+    dataset_type: DatasetType,
+    image_size: int = 224,
+    aug_profile: str = "basic",
+):
+    """获取指定数据集类型的数据增强（可切换 profile 便于消融）。"""
     from torchvision import transforms
+
+    profile = aug_profile.lower().strip()
+
+    if profile == "strong":
+        train_tf = transforms.Compose([
+            transforms.Resize((image_size + 16, image_size + 16)),
+            transforms.RandomResizedCrop(image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.2),
+            transforms.RandomAffine(degrees=12, translate=(0.06, 0.06), scale=(0.9, 1.1)),
+            transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
+            transforms.RandomAdjustSharpness(sharpness_factor=1.8, p=0.2),
+            transforms.ToTensor(),
+            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        val_test_tf = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5], std=[0.5]),
+        ])
+        return train_tf, val_test_tf
 
     if dataset_type == DatasetType.IQ_OTHNCCD:
         train_tf = transforms.Compose([

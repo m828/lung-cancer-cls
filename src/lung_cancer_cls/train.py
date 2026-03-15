@@ -529,6 +529,12 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             else:
                 scheduler.step()
 
+        if scheduler is not None and not scheduler_step_per_batch:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_acc)
+            else:
+                scheduler.step()
+
         history.append({
             "epoch": epoch,
             "train_loss": train_loss,

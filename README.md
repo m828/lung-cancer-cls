@@ -110,6 +110,7 @@ python train.py \
 | `--lr` | 学习率 | 1e-3 |
 | `--weight-decay` | 权重衰减 | 1e-4 |
 | `--train-ratio` | 训练集比例（剩余平分验证/测试） | 0.8 |
+| `--split-mode` | 划分模式：`train_val_test`（80/10/10）或 `train_val`（8/2，无测试集） | train_val_test |
 | `--model` | 模型：`simple`/`resnet18`/`resnet18_se`/`resnet18_cbam`/`efficientnet_b0`/`convnext_tiny`/`resnet3d18` | simple |
 | `--pretrained` | 使用预训练（对 2D ImageNet 与 3D Kinetics400 模型生效） | False |
 | `--aug-profile` | 数据增强：`basic` / `strong` | basic |
@@ -145,6 +146,7 @@ python train.py \
   --use-predefined-split \
   --output-dir outputs/intranet_ct_resnet18 \
   --model resnet18 \
+  --split-mode train_val \
   --epochs 30
 ```
 

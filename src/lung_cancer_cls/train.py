@@ -42,6 +42,7 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     train_ratio: float = 0.8
+    split_mode: str = "train_val_test"
     seed: int = 42
     cpu: bool = False
     model: str = "simple"
@@ -135,6 +136,43 @@ def stratified_split(
                 train_idx.remove(idx)
 
     return train_idx, val_idx, test_idx
+
+
+def stratified_train_val_split(
+    samples: Sequence[Sample],
+    train_ratio: float,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
+    """按类别分层做 train/val 划分，不生成测试集（例如 8:2）。"""
+    from sklearn.model_selection import train_test_split
+
+    by_label: Dict[int, List[int]] = defaultdict(list)
+    for idx, s in enumerate(samples):
+        by_label[s.label].append(idx)
+
+    train_idx, val_idx = [], []
+    for _, idxs in by_label.items():
+        if len(idxs) <= 1:
+            train_idx.extend(idxs)
+            continue
+
+        train_imgs, val_imgs = train_test_split(
+            idxs,
+            test_size=(1 - train_ratio),
+            random_state=seed,
+            shuffle=True,
+        )
+        train_idx.extend(train_imgs)
+        val_idx.extend(val_imgs)
+
+    if len(val_idx) == 0 and train_idx:
+        num_val = min(5, max(1, len(train_idx) // 10))
+        val_indices = random.sample(train_idx, num_val)
+        for idx in val_indices:
+            val_idx.append(idx)
+            train_idx.remove(idx)
+
+    return train_idx, val_idx
 
 
 def evaluate(
@@ -232,7 +270,11 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         print(f"  {class_name} (label={label}): {label_counts[label]}")
 
     # 2. 数据划分
-    train_idx, val_idx, test_idx = stratified_split(samples, config.train_ratio, config.seed)
+    if config.split_mode == "train_val":
+        train_idx, val_idx = stratified_train_val_split(samples, config.train_ratio, config.seed)
+        test_idx: List[int] = []
+    else:
+        train_idx, val_idx, test_idx = stratified_split(samples, config.train_ratio, config.seed)
 
     # 可选：使用数据表中的预定义划分（适合内网数据）
     if config.use_predefined_split:
@@ -247,14 +289,25 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         predefined_val = split_to_idx.get("val", []) + split_to_idx.get("valid", [])
         predefined_test = split_to_idx.get("test", [])
 
-        if predefined_train and (predefined_val or predefined_test):
+        if config.split_mode == "train_val":
+            if predefined_train and predefined_val:
+                train_idx = predefined_train
+                val_idx = predefined_val
+                test_idx = []
+                print("使用 metadata 预定义划分（train/val）")
+            else:
+                print("预定义 train/val 划分不可用，回退为分层划分")
+        elif predefined_train and (predefined_val or predefined_test):
             train_idx = predefined_train
             val_idx = predefined_val
             test_idx = predefined_test
             print("使用 metadata 预定义划分")
         else:
             print("预定义划分不可用，回退为统一分层划分")
-    print(f"\n数据划分: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
+    if config.split_mode == "train_val":
+        print(f"\n数据划分: train={len(train_idx)}, val={len(val_idx)} (无测试集)")
+    else:
+        print(f"\n数据划分: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     # 3. 获取数据增强
     train_tf, val_test_tf = get_default_transforms(
@@ -269,19 +322,22 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     use_3d = config.use_3d_input or config.model == "resnet3d18"
 
+    test_ds = None
     if config.dataset_type == DatasetType.IQ_OTHNCCD:
         if use_3d:
             raise ValueError("IQ-OTH/NCCD 是 2D 数据，不能使用 3D 输入模式")
         train_ds = Subset(IQOTHNCCDDataset(samples, transform=train_tf), train_idx)
         val_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), val_idx)
-        test_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), test_idx)
+        if config.split_mode == "train_val_test":
+            test_ds = Subset(IQOTHNCCDDataset(samples, transform=val_test_tf), test_idx)
     else:
         if config.dataset_type == DatasetType.LUNA16:
             if use_3d:
                 raise ValueError("当前 LUNA16 流程使用 2D 切片，不能使用 3D 输入模式")
             train_ds = Subset(LUNA16Dataset(samples, transform=train_tf), train_idx)
             val_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), val_idx)
-            test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
+            if config.split_mode == "train_val_test":
+                test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
         else:
             train_ds = Subset(
                 IntranetCTDataset(
@@ -301,15 +357,16 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 ),
                 val_idx,
             )
-            test_ds = Subset(
-                IntranetCTDataset(
-                    samples,
-                    transform=None if use_3d else val_test_tf,
-                    use_3d=use_3d,
-                    depth_size=config.depth_size,
-                ),
-                test_idx,
-            )
+            if config.split_mode == "train_val_test":
+                test_ds = Subset(
+                    IntranetCTDataset(
+                        samples,
+                        transform=None if use_3d else val_test_tf,
+                        use_3d=use_3d,
+                        depth_size=config.depth_size,
+                    ),
+                    test_idx,
+                )
 
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
@@ -340,10 +397,12 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         val_ds, batch_size=config.batch_size,
         shuffle=False, num_workers=config.num_workers
     )
-    test_loader = DataLoader(
-        test_ds, batch_size=config.batch_size,
-        shuffle=False, num_workers=config.num_workers
-    )
+    test_loader = None
+    if test_ds is not None:
+        test_loader = DataLoader(
+            test_ds, batch_size=config.batch_size,
+            shuffle=False, num_workers=config.num_workers
+        )
 
     # 5. 创建模型
     print(f"\n模型: {config.model} (pretrained={config.pretrained})")
@@ -426,11 +485,17 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             print(f"  保存最佳模型 (epoch {epoch})")
 
     # 8. 评估测试集
-    print("\n" + "-" * 60)
-    print("在测试集上评估最佳模型...")
-    model.load_state_dict(torch.load(out_dir / "best_model.pt"))
-    test_loss, test_acc = evaluate(model, test_loader, device, criterion)
-    print(f"测试结果: loss={test_loss:.4f}, acc={test_acc:.4f}")
+    test_loss: float | None = None
+    test_acc: float | None = None
+    if test_loader is not None:
+        print("\n" + "-" * 60)
+        print("在测试集上评估最佳模型...")
+        model.load_state_dict(torch.load(out_dir / "best_model.pt"))
+        test_loss, test_acc = evaluate(model, test_loader, device, criterion)
+        print(f"测试结果: loss={test_loss:.4f}, acc={test_acc:.4f}")
+    else:
+        print("\n" + "-" * 60)
+        print("跳过测试集评估（split_mode=train_val）")
 
     # 9. 保存指标
     metrics = {
@@ -448,6 +513,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "sampling_strategy": config.sampling_strategy,
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
+            "split_mode": config.split_mode,
         }
     }
 
@@ -457,7 +523,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print("\n" + "=" * 60)
     print("训练完成!")
     print(f"最佳验证准确率: {best_val_acc:.4f}")
-    print(f"测试准确率: {test_acc:.4f}")
+    if test_acc is not None:
+        print(f"测试准确率: {test_acc:.4f}")
     print(f"结果已保存到: {out_dir}")
     print("=" * 60)
 
@@ -515,7 +582,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--train-ratio", type=float, default=0.8,
-        help="训练集比例 (默认: 0.8)，剩余 20%% 平分为验证集和测试集"
+        help="训练集比例 (默认: 0.8)；在 train_val_test 中剩余用于 val/test，在 train_val 中剩余全部用于 val"
+    )
+    parser.add_argument(
+        "--split-mode", type=str, choices=["train_val_test", "train_val"], default="train_val_test",
+        help="数据划分模式：train_val_test(80/10/10) 或 train_val(8/2，无测试集)"
     )
     parser.add_argument(
         "--seed", type=int, default=42,
@@ -612,6 +683,7 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         train_ratio=args.train_ratio,
+        split_mode=args.split_mode,
         seed=args.seed,
         cpu=args.cpu,
         model=args.model,

@@ -79,6 +79,111 @@ def canonicalize_class_name(name: str) -> str | None:
     return ALIASES.get(name.strip().lower())
 
 
+class DataGenerator(Dataset):
+    """Mask-aware 数据读取器（借鉴 Subregion-Unet 的 txt 配置方式）。
+
+    txt 每行支持以下格式之一：
+    1) `mask_path image_path label`
+    2) `mask_path image_path`（标签从 image_path 父目录名推断）
+    """
+
+    def __init__(
+        self,
+        txtpath: str | Path,
+        image_transform: Callable | None = None,
+        mask_transform: Callable | None = None,
+    ):
+        self.datatxtpath = Path(txtpath)
+        self.image_transform = image_transform
+        self.mask_transform = mask_transform
+        self.samples = self.read_txt()
+
+    def read_txt(self) -> List[Sample]:
+        samples: List[Sample] = []
+        if not self.datatxtpath.exists():
+            raise FileNotFoundError(f"Mask txt not found: {self.datatxtpath}")
+
+        with open(self.datatxtpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+
+                mask_path = Path(parts[0])
+                image_path = Path(parts[1])
+
+                if len(parts) >= 3:
+                    label_token = parts[2].strip().lower()
+                    if label_token.isdigit():
+                        label = int(label_token)
+                    else:
+                        canonical = canonicalize_class_name(label_token)
+                        if canonical is None:
+                            continue
+                        label = CLASS_NAME_TO_ID[canonical]
+                else:
+                    canonical = canonicalize_class_name(image_path.parent.name)
+                    if canonical is None:
+                        continue
+                    label = CLASS_NAME_TO_ID[canonical]
+
+                if not image_path.exists() or not mask_path.exists():
+                    continue
+
+                samples.append(
+                    Sample(
+                        image_path=image_path,
+                        label=label,
+                        metadata={"mask_path": str(mask_path)},
+                    )
+                )
+
+        if not samples:
+            raise RuntimeError("No valid mask-aware samples parsed from txt")
+        return samples
+
+    def get_samples(self) -> List[Sample]:
+        return self.samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        sample = self.samples[idx]
+        mask_path = Path(sample.metadata["mask_path"]) if sample.metadata else None
+        if mask_path is None:
+            raise ValueError("Mask path missing in sample metadata")
+
+        img = Image.open(sample.image_path).convert("L")
+        mask = Image.open(mask_path).convert("L")
+
+        mask_arr = np.array(mask)
+        mask_arr[mask_arr != 0] = 255
+        mask = Image.fromarray(mask_arr.astype(np.uint8))
+
+        if self.image_transform is not None:
+            img = self.image_transform(img)
+        else:
+            from torchvision import transforms
+
+            img = transforms.ToTensor()(img)
+
+        if self.mask_transform is not None:
+            mask = self.mask_transform(mask)
+        else:
+            from torchvision import transforms
+
+            mask = transforms.ToTensor()(mask)
+
+        if isinstance(mask, torch.Tensor):
+            mask = (mask > 0.5).float()
+
+        return img, sample.label, mask
+
+
 # ======================================
 # IQ-OTH/NCCD 数据集
 # ======================================

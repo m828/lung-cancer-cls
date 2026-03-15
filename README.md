@@ -117,6 +117,9 @@ python train.py \
 | `--loss` | 损失：`ce` / `focal` | ce |
 | `--label-smoothing` | CE 标签平滑 | 0.0 |
 | `--focal-gamma` | Focal Loss gamma | 2.0 |
+| `--mask-loss-weight` | `mask_aware` 中掩膜分支 CE 权重 | 0.5 |
+| `--consistency-weight` | `mask_aware` 中一致性 KL 权重 | 0.1 |
+| `--use-mask-guided-input` | 使用 mask 先过滤输入，减少背景噪声 | False |
 | `--optimizer` | 优化器：`adamw` / `sgd` | adamw |
 | `--scheduler` | 调度器：`none` / `cosine` / `onecycle` / `plateau` | none |
 | `--sampling-strategy` | 采样策略：`default` / `weighted` | default |
@@ -132,6 +135,7 @@ python train.py \
 | `--metadata-csv` | 内网索引表 CSV 路径 | `data-root/多模态统一检索表_CT本地路径_CT划分.csv` |
 | `--ct-root` | CT `.npy` 根目录 | `data-root` |
 | `--use-predefined-split` | 使用 CSV 中的 `train/val/test` 划分 | False |
+| `--mask-txt` | mask-aware 样本列表（每行：`mask_path image_path [label]`） | None |
 | `--use-3d-input` | 启用 3D 体输入（仅内网 `.npy`） | False |
 | `--depth-size` | 3D 输入重采样深度 | 32 |
 
@@ -212,6 +216,31 @@ python train.py \
 - `swin3d_tiny`：Video Swin Transformer（3D Transformer 强基线）
 - `densenet3d`：轻量 3D DenseNet（参数高效）
 - `attention3d_cnn`：Attention 3D CNN（SE 注意力）
+
+### Subregion-Unet 思想整合（Mask-aware）
+
+- 新增 `DataGenerator`（`src/lung_cancer_cls/dataset.py`）支持按 txt 读取 `mask + image (+label)`。
+- 新增 `mask_aware` 损失（`src/lung_cancer_cls/training_components.py`）：
+  - `CE(full)` + `mask_loss_weight * CE(masked)` + `consistency_weight * KL(masked || full)`
+- 可选 `--use-mask-guided-input`，先对输入做 `x * mask`，进一步抑制背景噪声。
+
+示例（结节区域关注训练）：
+
+```bash
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /path/to/root \
+  --mask-txt /path/to/mask_image_list.txt \
+  --output-dir outputs/mask_aware_swin3d \
+  --model swin3d_tiny \
+  --split-mode train_val \
+  --loss mask_aware \
+  --mask-loss-weight 0.6 \
+  --consistency-weight 0.1 \
+  --use-mask-guided-input \
+  --optimizer adamw --lr 3e-4 --weight-decay 1e-4 \
+  --scheduler cosine
+```
 
 ### 数据增强（`--aug-profile`）
 

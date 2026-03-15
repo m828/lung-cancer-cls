@@ -19,9 +19,11 @@ from lung_cancer_cls.dataset import (
     Sample,
     create_dataset,
     get_default_transforms,
+    DataGenerator,
 )
 from lung_cancer_cls.model import build_model
 from lung_cancer_cls.training_components import (
+    MaskAwareClassificationLoss,
     build_class_weights,
     create_loss,
     create_optimizer,
@@ -61,6 +63,21 @@ class TrainConfig:
     use_predefined_split: bool = False
     use_3d_input: bool = False
     depth_size: int = 32
+    mask_txt: Path | None = None
+    mask_loss_weight: float = 0.5
+    consistency_weight: float = 0.1
+    use_mask_guided_input: bool = False
+
+
+def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """兼容 (x,y) 与 (x,y,mask) 两种 batch 格式。"""
+    if isinstance(batch, (list, tuple)) and len(batch) == 2:
+        x, y = batch
+        return x, y, None
+    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+        x, y, mask = batch
+        return x, y, mask
+    raise ValueError(f"Unsupported batch format: {type(batch)}")
 
 
 def set_seed(seed: int) -> None:
@@ -179,7 +196,8 @@ def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    criterion: nn.Module
+    criterion: nn.Module,
+    use_mask_guided_input: bool = False,
 ) -> Tuple[float, float]:
     """统一的评估函数"""
     model.eval()
@@ -188,10 +206,19 @@ def evaluate(
     total = 0
 
     with torch.no_grad():
-        for x, y in loader:
+        for batch in loader:
+            x, y, mask = unpack_batch(batch)
             x, y = x.to(device), y.to(device)
+            mask_t = mask.to(device) if isinstance(mask, torch.Tensor) else None
+            if use_mask_guided_input and mask_t is not None:
+                x = x * mask_t
+
             logits = model(x)
-            loss = criterion(logits, y)
+            if isinstance(criterion, MaskAwareClassificationLoss) and mask_t is not None:
+                masked_logits = model(x * mask_t)
+                loss = criterion(logits, y, masked_logits=masked_logits)
+            else:
+                loss = criterion(logits, y)
             total_loss += loss.item() * y.size(0)
             pred = logits.argmax(dim=1)
             correct += (pred == y).sum().item()
@@ -208,17 +235,27 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     scheduler: Any = None,
     scheduler_step_per_batch: bool = False,
+    use_mask_guided_input: bool = False,
 ) -> float:
     """统一的单轮训练函数"""
     model.train()
     running_loss = 0.0
     seen = 0
 
-    for x, y in loader:
+    for batch in loader:
+        x, y, mask = unpack_batch(batch)
         x, y = x.to(device), y.to(device)
+        mask_t = mask.to(device) if isinstance(mask, torch.Tensor) else None
+        if use_mask_guided_input and mask_t is not None:
+            x = x * mask_t
+
         optimizer.zero_grad()
         logits = model(x)
-        loss = criterion(logits, y)
+        if isinstance(criterion, MaskAwareClassificationLoss) and mask_t is not None:
+            masked_logits = model(x * mask_t)
+            loss = criterion(logits, y, masked_logits=masked_logits)
+        else:
+            loss = criterion(logits, y)
         loss.backward()
         optimizer.step()
         if scheduler is not None and scheduler_step_per_batch:
@@ -251,13 +288,18 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 1. 创建数据集
     print("\n正在加载数据集...")
     dataset_kwargs: Dict[str, Any] = {}
-    if config.dataset_type == DatasetType.INTRANET_CT:
-        if config.metadata_csv is not None:
-            dataset_kwargs["metadata_csv"] = config.metadata_csv
-        if config.ct_root is not None:
-            dataset_kwargs["ct_root"] = config.ct_root
-    full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
-    samples = full_dataset.get_samples()
+    full_dataset: Any
+    if config.mask_txt is not None:
+        full_dataset = DataGenerator(txtpath=config.mask_txt)
+        samples = full_dataset.get_samples()
+    else:
+        if config.dataset_type == DatasetType.INTRANET_CT:
+            if config.metadata_csv is not None:
+                dataset_kwargs["metadata_csv"] = config.metadata_csv
+            if config.ct_root is not None:
+                dataset_kwargs["ct_root"] = config.ct_root
+        full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
+        samples = full_dataset.get_samples()
     print(f"找到 {len(samples)} 个样本")
 
     # 打印类别分布
@@ -319,12 +361,23 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 这里我们使用相同的 samples，但创建新的带 transform 的 dataset
     # 先获取样本列表，然后创建带 transform 的数据集
     from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, IntranetCTDataset
+    from torchvision import transforms
+
+    mask_tf = transforms.Compose([
+        transforms.Resize((config.image_size, config.image_size), interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.ToTensor(),
+    ])
 
     auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "attention3d_cnn"}
     use_3d = config.use_3d_input or config.model in auto_3d_models
 
     test_ds = None
-    if config.dataset_type == DatasetType.IQ_OTHNCCD:
+    if config.mask_txt is not None:
+        train_ds = Subset(DataGenerator(txtpath=config.mask_txt, image_transform=train_tf, mask_transform=mask_tf), train_idx)
+        val_ds = Subset(DataGenerator(txtpath=config.mask_txt, image_transform=val_test_tf, mask_transform=mask_tf), val_idx)
+        if config.split_mode == "train_val_test":
+            test_ds = Subset(DataGenerator(txtpath=config.mask_txt, image_transform=val_test_tf, mask_transform=mask_tf), test_idx)
+    elif config.dataset_type == DatasetType.IQ_OTHNCCD:
         if use_3d:
             raise ValueError("IQ-OTH/NCCD 是 2D 数据，不能使用 3D 输入模式")
         train_ds = Subset(IQOTHNCCDDataset(samples, transform=train_tf), train_idx)
@@ -430,6 +483,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             strategy=config.class_weight_strategy,
             effective_num_beta=config.effective_num_beta,
         ),
+        mask_loss_weight=config.mask_loss_weight,
+        consistency_weight=config.consistency_weight,
     ).to(device)
     scheduler, scheduler_step_per_batch = create_scheduler(
         config.scheduler_name,
@@ -458,8 +513,21 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             optimizer,
             scheduler=scheduler,
             scheduler_step_per_batch=scheduler_step_per_batch,
+            use_mask_guided_input=config.use_mask_guided_input,
         )
-        val_loss, val_acc = evaluate(model, val_loader, device, criterion)
+        val_loss, val_acc = evaluate(
+            model,
+            val_loader,
+            device,
+            criterion,
+            use_mask_guided_input=config.use_mask_guided_input,
+        )
+
+        if scheduler is not None and not scheduler_step_per_batch:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(val_acc)
+            else:
+                scheduler.step()
 
         if scheduler is not None and not scheduler_step_per_batch:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -492,7 +560,13 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         print("\n" + "-" * 60)
         print("在测试集上评估最佳模型...")
         model.load_state_dict(torch.load(out_dir / "best_model.pt"))
-        test_loss, test_acc = evaluate(model, test_loader, device, criterion)
+        test_loss, test_acc = evaluate(
+            model,
+            test_loader,
+            device,
+            criterion,
+            use_mask_guided_input=config.use_mask_guided_input,
+        )
         print(f"测试结果: loss={test_loss:.4f}, acc={test_acc:.4f}")
     else:
         print("\n" + "-" * 60)
@@ -515,6 +589,11 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
             "split_mode": config.split_mode,
+            "loss_name": config.loss_name,
+            "mask_txt": str(config.mask_txt) if config.mask_txt else None,
+            "mask_loss_weight": config.mask_loss_weight,
+            "consistency_weight": config.consistency_weight,
+            "use_mask_guided_input": config.use_mask_guided_input,
         }
     }
 
@@ -555,6 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-csv", type=str, default=None, help="内网数据索引 CSV 路径")
     parser.add_argument("--ct-root", type=str, default=None, help="内网 CT .npy 根目录")
     parser.add_argument("--use-predefined-split", action="store_true", help="使用索引表中的 train/val/test 划分")
+    parser.add_argument("--mask-txt", type=str, default=None, help="mask-aware txt 列表（每行: mask_path image_path [label]）")
 
     # 训练参数
     parser.add_argument(
@@ -625,8 +705,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="数据增强配置：basic / strong"
     )
     parser.add_argument(
-        "--loss", type=str, choices=["ce", "focal"], default="ce",
-        help="损失函数：ce / focal"
+        "--loss", type=str, choices=["ce", "focal", "mask_aware"], default="ce",
+        help="损失函数：ce / focal / mask_aware"
     )
     parser.add_argument(
         "--label-smoothing", type=float, default=0.0,
@@ -636,6 +716,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--focal-gamma", type=float, default=2.0,
         help="Focal Loss gamma，仅 loss=focal 时有效"
     )
+    parser.add_argument("--mask-loss-weight", type=float, default=0.5, help="mask_aware 中掩膜分支 CE 权重")
+    parser.add_argument("--consistency-weight", type=float, default=0.1, help="mask_aware 中一致性 KL 权重")
+    parser.add_argument("--use-mask-guided-input", action="store_true", help="用 mask 先过滤输入以降低背景噪声")
     parser.add_argument(
         "--optimizer", type=str, choices=["adamw", "sgd"], default="adamw",
         help="优化器：adamw / sgd"
@@ -698,6 +781,9 @@ def main():
         loss_name=args.loss,
         label_smoothing=args.label_smoothing,
         focal_gamma=args.focal_gamma,
+        mask_loss_weight=args.mask_loss_weight,
+        consistency_weight=args.consistency_weight,
+        use_mask_guided_input=args.use_mask_guided_input,
         optimizer_name=args.optimizer,
         scheduler_name=args.scheduler,
         sampling_strategy=args.sampling_strategy,
@@ -708,6 +794,7 @@ def main():
         metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
         ct_root=Path(args.ct_root) if args.ct_root else None,
         use_predefined_split=args.use_predefined_split,
+        mask_txt=Path(args.mask_txt) if args.mask_txt else None,
     )
 
     train_model(config)

@@ -41,6 +41,45 @@ class FocalLoss(nn.Module):
         return loss.mean()
 
 
+class MaskAwareClassificationLoss(nn.Module):
+    """Mask-aware 分类损失。
+
+    总损失 = CE(logits, y)
+           + mask_loss_weight * CE(masked_logits, y)
+           + consistency_weight * KL(masked || full)
+    """
+
+    def __init__(
+        self,
+        class_weights: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+        mask_loss_weight: float = 0.5,
+        consistency_weight: float = 0.1,
+    ):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        self.mask_loss_weight = mask_loss_weight
+        self.consistency_weight = consistency_weight
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        masked_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        base_loss = self.ce(logits, targets)
+        if masked_logits is None:
+            return base_loss
+
+        mask_ce = self.ce(masked_logits, targets)
+        kl = F.kl_div(
+            F.log_softmax(masked_logits, dim=1),
+            F.softmax(logits.detach(), dim=1),
+            reduction="batchmean",
+        )
+        return base_loss + self.mask_loss_weight * mask_ce + self.consistency_weight * kl
+
+
 def build_class_weights(
     counts: Sequence[int],
     strategy: str = "none",
@@ -72,12 +111,21 @@ def create_loss(
     label_smoothing: float = 0.0,
     focal_gamma: float = 2.0,
     class_weights: torch.Tensor | None = None,
+    mask_loss_weight: float = 0.5,
+    consistency_weight: float = 0.1,
 ) -> nn.Module:
     name = loss_name.lower().strip()
     if name == "ce":
         return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     if name == "focal":
         return FocalLoss(gamma=focal_gamma, alpha=class_weights)
+    if name == "mask_aware":
+        return MaskAwareClassificationLoss(
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+            mask_loss_weight=mask_loss_weight,
+            consistency_weight=consistency_weight,
+        )
     raise ValueError(f"Unknown loss: {loss_name}")
 
 

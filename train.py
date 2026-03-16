@@ -20,6 +20,12 @@
      --data-root /workspace/data-lung/luna16/extracted_slices \
      --output-dir outputs/luna16_resnet18 \
      --model resnet18 --pretrained --epochs 50
+
+3. 训练 LIDC-IDRI 数据集:
+   python train.py --dataset-type lidc_idri \
+     --data-root /workspace/data-lung/lidc_idri_slices \
+     --output-dir outputs/lidc_idri_resnet18 \
+     --model resnet18 --pretrained --epochs 50
 """
 
 import sys

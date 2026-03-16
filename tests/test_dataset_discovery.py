@@ -59,6 +59,18 @@ def test_luna16_raw_dir_without_extracted_slices_raises(tmp_path: Path):
         create_dataset(DatasetType.LUNA16, tmp_path)
 
 
+def test_lidc_idri_discovery(tmp_path: Path):
+    """测试 LIDC-IDRI 目录发现。"""
+    _write_img(tmp_path / "normal" / "n1.png")
+    _write_img(tmp_path / "benign" / "b1.png")
+    _write_img(tmp_path / "malignant" / "m1.png")
+
+    dataset = create_dataset(DatasetType.LIDC_IDRI, tmp_path)
+    samples = dataset.get_samples()
+    labels = sorted([s.label for s in samples])
+    assert labels == [0, 1, 2]
+
+
 def test_intranet_ct_discovery(tmp_path: Path):
     ct_root = tmp_path / "ct_root"
     ct_root.mkdir()

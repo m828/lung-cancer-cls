@@ -1,11 +1,11 @@
 # lung-cancer-cls
 
-一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD、LUNA16 和内网 CT（`intranet_ct`）三个数据来源，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
+一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD、LUNA16、LIDC-IDRI 和内网 CT（`intranet_ct`）四个数据来源，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
 
 ## 1. 目标
 
 - 统一训练框架：数据划分、训练循环、验证完全一致
-- 支持三个数据源：IQ-OTH/NCCD（2D 图像）、LUNA16（3D CT 切片）、内网 CT（CSV 索引 + .npy）
+- 支持四个数据源：IQ-OTH/NCCD（2D 图像）、LUNA16（2D 切片）、LIDC-IDRI（2D 切片）、内网 CT（CSV 索引 + .npy）
 - 先在公开数据集 IQ-OTH/NCCD 上跑通，再扩展到 LUNA16
 - 输出可迁移到内网数据的训练骨架
 
@@ -26,6 +26,7 @@ lung-cancer-cls/
 ├── train.py                # 统一训练入口
 ├── train_iqothnccd.py       # IQ-OTH/NCCD 快捷训练
 ├── train_luna16.py          # LUNA16 快捷训练
+├── train_lidc_idri.py       # LIDC-IDRI 快捷训练
 ├── prepare_luna16_slices.py # LUNA16 切片提取
 ├── requirements.txt          # 依赖
 └── TRAINING_GUIDE.md        # 统一训练框架使用说明
@@ -93,6 +94,26 @@ python train.py \
   --model resnet18 \
   --pretrained \
   --epochs 30
+
+**训练 LIDC-IDRI**
+```bash
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_slices \
+  --output-dir outputs/lidc_idri_resnet18 \
+  --model resnet18 \
+  --pretrained \
+  --split-mode train_val_test \
+  --epochs 30
+
+# 若已有独立测试集，仅做 train/val 8:2
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_slices \
+  --output-dir outputs/lidc_idri_train_val_only \
+  --model resnet18 \
+  --split-mode train_val \
+  --epochs 30
 ```
 
 ## 5. 统一参数说明
@@ -101,7 +122,7 @@ python train.py \
 
 | 参数 | 说明 | 默认值 |
 |------|------|---------|
-| `--dataset-type` | 数据集类型：`iqothnccd` / `luna16` / `intranet_ct` | 必填 |
+| `--dataset-type` | 数据集类型：`iqothnccd` / `luna16` / `lidc_idri` / `intranet_ct` | 必填 |
 | `--data-root` | 数据集根目录 | 必填 |
 | `--output-dir` | 输出目录 | 必填 |
 | `--image-size` | 输入图像尺寸 | 224 |

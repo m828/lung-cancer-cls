@@ -16,6 +16,7 @@ class DatasetType(Enum):
     """支持的数据集类型"""
     IQ_OTHNCCD = auto()
     LUNA16 = auto()
+    LIDC_IDRI = auto()
     INTRANET_CT = auto()
 
 
@@ -349,6 +350,58 @@ class LUNA16Dataset(BaseCTDataset):
 
 
 # ======================================
+# LIDC-IDRI 数据集
+# ======================================
+
+
+class LIDCIDRIDataset(BaseCTDataset):
+    """LIDC-IDRI 数据集（使用预处理后的 2D 切片目录）。"""
+
+    def __init__(self, samples: Sequence[Sample], transform: Callable | None = None):
+        self.samples = list(samples)
+        self.transform = transform
+
+    def get_samples(self) -> List[Sample]:
+        return self.samples
+
+    @classmethod
+    def discover(cls, root: Path, **kwargs) -> 'LIDCIDRIDataset':
+        """发现 LIDC-IDRI 样本（normal/benign/malignant 目录结构）。"""
+        if not root.exists():
+            raise FileNotFoundError(f"Dataset path not found: {root}")
+
+        samples: List[Sample] = []
+        for label_dir in root.iterdir():
+            if not label_dir.is_dir():
+                continue
+
+            canonical = canonicalize_class_name(label_dir.name)
+            if canonical is None:
+                continue
+            label = CLASS_NAME_TO_ID[canonical]
+
+            for p in label_dir.iterdir():
+                if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                    samples.append(Sample(image_path=p, label=label))
+
+        if not samples:
+            raise RuntimeError(
+                "No LIDC-IDRI samples discovered. Expect subfolders like normal/benign/malignant with images."
+            )
+        return cls(samples)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        sample = self.samples[idx]
+        img = Image.open(sample.image_path).convert("L")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, sample.label
+
+
+# ======================================
 # 内网 CT 数据集
 # ======================================
 
@@ -490,6 +543,8 @@ def create_dataset(dataset_type: DatasetType, root: Path, **kwargs) -> BaseCTDat
         return IQOTHNCCDDataset.discover(root, **kwargs)
     elif dataset_type == DatasetType.LUNA16:
         return LUNA16Dataset.discover(root, **kwargs)
+    elif dataset_type == DatasetType.LIDC_IDRI:
+        return LIDCIDRIDataset.discover(root, **kwargs)
     elif dataset_type == DatasetType.INTRANET_CT:
         return IntranetCTDataset.discover(root, **kwargs)
     else:

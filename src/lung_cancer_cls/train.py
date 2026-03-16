@@ -360,7 +360,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 重新应用 transform（因为 create_dataset 返回的可能没有 transform）
     # 这里我们使用相同的 samples，但创建新的带 transform 的 dataset
     # 先获取样本列表，然后创建带 transform 的数据集
-    from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, IntranetCTDataset
+    from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, LIDCIDRIDataset, IntranetCTDataset
     from torchvision import transforms
 
     mask_tf = transforms.Compose([
@@ -392,6 +392,13 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             val_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), val_idx)
             if config.split_mode == "train_val_test":
                 test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
+        elif config.dataset_type == DatasetType.LIDC_IDRI:
+            if use_3d:
+                raise ValueError("当前 LIDC-IDRI 流程使用 2D 切片，不能使用 3D 输入模式")
+            train_ds = Subset(LIDCIDRIDataset(samples, transform=train_tf), train_idx)
+            val_ds = Subset(LIDCIDRIDataset(samples, transform=val_test_tf), val_idx)
+            if config.split_mode == "train_val_test":
+                test_ds = Subset(LIDCIDRIDataset(samples, transform=val_test_tf), test_idx)
         else:
             train_ds = Subset(
                 IntranetCTDataset(
@@ -529,12 +536,6 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             else:
                 scheduler.step()
 
-        if scheduler is not None and not scheduler_step_per_batch:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_acc)
-            else:
-                scheduler.step()
-
         history.append({
             "epoch": epoch,
             "train_loss": train_loss,
@@ -615,13 +616,13 @@ def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器"""
     parser = argparse.ArgumentParser(
         description="肺癌 CT 三分类统一训练框架 "
-                    "(支持 IQ-OTH/NCCD 和 LUNA16)"
+                    "(支持 IQ-OTH/NCCD、LUNA16、LIDC-IDRI、intranet_ct)"
     )
 
     # 必需参数
     parser.add_argument(
-        "--dataset-type", type=str, choices=["iqothnccd", "luna16", "intranet_ct"],
-        required=True, help="数据集类型: iqothnccd / luna16 / intranet_ct"
+        "--dataset-type", type=str, choices=["iqothnccd", "luna16", "lidc_idri", "intranet_ct"],
+        required=True, help="数据集类型: iqothnccd / luna16 / lidc_idri / intranet_ct"
     )
     parser.add_argument(
         "--data-root", type=str, required=True,
@@ -756,6 +757,8 @@ def main():
         dataset_type = DatasetType.IQ_OTHNCCD
     elif dataset_str == "luna16":
         dataset_type = DatasetType.LUNA16
+    elif dataset_str == "lidc_idri":
+        dataset_type = DatasetType.LIDC_IDRI
     elif dataset_str == "intranet_ct":
         dataset_type = DatasetType.INTRANET_CT
     else:

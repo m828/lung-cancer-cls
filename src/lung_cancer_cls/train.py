@@ -285,6 +285,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print(f"输出目录: {config.output_dir}")
     print("=" * 60)
 
+    auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "attention3d_cnn"}
+    use_3d = config.use_3d_input or config.model in auto_3d_models
+
     # 1. 创建数据集
     print("\n正在加载数据集...")
     dataset_kwargs: Dict[str, Any] = {}
@@ -298,6 +301,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 dataset_kwargs["metadata_csv"] = config.metadata_csv
             if config.ct_root is not None:
                 dataset_kwargs["ct_root"] = config.ct_root
+        if config.dataset_type == DatasetType.LIDC_IDRI and use_3d:
+            dataset_kwargs["use_3d"] = True
+            dataset_kwargs["depth_size"] = config.depth_size
         full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
         samples = full_dataset.get_samples()
     print(f"找到 {len(samples)} 个样本")
@@ -368,9 +374,6 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         transforms.ToTensor(),
     ])
 
-    auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "attention3d_cnn"}
-    use_3d = config.use_3d_input or config.model in auto_3d_models
-
     test_ds = None
     if config.mask_txt is not None:
         train_ds = Subset(DataGenerator(txtpath=config.mask_txt, image_transform=train_tf, mask_transform=mask_tf), train_idx)
@@ -393,12 +396,34 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             if config.split_mode == "train_val_test":
                 test_ds = Subset(LUNA16Dataset(samples, transform=val_test_tf), test_idx)
         elif config.dataset_type == DatasetType.LIDC_IDRI:
-            if use_3d:
-                raise ValueError("当前 LIDC-IDRI 流程使用 2D 切片，不能使用 3D 输入模式")
-            train_ds = Subset(LIDCIDRIDataset(samples, transform=train_tf), train_idx)
-            val_ds = Subset(LIDCIDRIDataset(samples, transform=val_test_tf), val_idx)
+            train_ds = Subset(
+                LIDCIDRIDataset(
+                    samples,
+                    transform=None if use_3d else train_tf,
+                    use_3d=use_3d,
+                    depth_size=config.depth_size,
+                ),
+                train_idx,
+            )
+            val_ds = Subset(
+                LIDCIDRIDataset(
+                    samples,
+                    transform=None if use_3d else val_test_tf,
+                    use_3d=use_3d,
+                    depth_size=config.depth_size,
+                ),
+                val_idx,
+            )
             if config.split_mode == "train_val_test":
-                test_ds = Subset(LIDCIDRIDataset(samples, transform=val_test_tf), test_idx)
+                test_ds = Subset(
+                    LIDCIDRIDataset(
+                        samples,
+                        transform=None if use_3d else val_test_tf,
+                        use_3d=use_3d,
+                        depth_size=config.depth_size,
+                    ),
+                    test_idx,
+                )
         else:
             train_ds = Subset(
                 IntranetCTDataset(

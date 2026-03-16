@@ -71,6 +71,20 @@ def test_lidc_idri_discovery(tmp_path: Path):
     assert labels == [0, 1, 2]
 
 
+def test_lidc_idri_3d_discovery_and_loading(tmp_path: Path):
+    import numpy as np
+
+    for cls_name in ["normal", "benign", "malignant"]:
+        d = tmp_path / cls_name
+        d.mkdir(parents=True, exist_ok=True)
+        np.save(d / f"{cls_name}.npy", np.random.randn(8, 16, 16).astype("float32"))
+
+    dataset = create_dataset(DatasetType.LIDC_IDRI, tmp_path, use_3d=True, depth_size=12)
+    x, y = dataset[0]
+    assert x.shape == (1, 12, 128, 128)
+    assert y in [0, 1, 2]
+
+
 def test_intranet_ct_discovery(tmp_path: Path):
     ct_root = tmp_path / "ct_root"
     ct_root.mkdir()

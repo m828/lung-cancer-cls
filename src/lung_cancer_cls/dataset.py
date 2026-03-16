@@ -355,11 +355,21 @@ class LUNA16Dataset(BaseCTDataset):
 
 
 class LIDCIDRIDataset(BaseCTDataset):
-    """LIDC-IDRI 数据集（使用预处理后的 2D 切片目录）。"""
+    """LIDC-IDRI 数据集（支持 2D 切片和 3D `.npy` 体数据）。"""
 
-    def __init__(self, samples: Sequence[Sample], transform: Callable | None = None):
+    def __init__(
+        self,
+        samples: Sequence[Sample],
+        transform: Callable | None = None,
+        use_3d: bool = False,
+        depth_size: int = 32,
+        volume_hw: int = 128,
+    ):
         self.samples = list(samples)
         self.transform = transform
+        self.use_3d = use_3d
+        self.depth_size = depth_size
+        self.volume_hw = volume_hw
 
     def get_samples(self) -> List[Sample]:
         return self.samples
@@ -369,6 +379,10 @@ class LIDCIDRIDataset(BaseCTDataset):
         """发现 LIDC-IDRI 样本（normal/benign/malignant 目录结构）。"""
         if not root.exists():
             raise FileNotFoundError(f"Dataset path not found: {root}")
+
+        use_3d = bool(kwargs.get("use_3d", False))
+        depth_size = int(kwargs.get("depth_size", 32))
+        volume_hw = int(kwargs.get("volume_hw", 128))
 
         samples: List[Sample] = []
         for label_dir in root.iterdir():
@@ -381,20 +395,49 @@ class LIDCIDRIDataset(BaseCTDataset):
             label = CLASS_NAME_TO_ID[canonical]
 
             for p in label_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in IMG_EXTS:
-                    samples.append(Sample(image_path=p, label=label))
+                if not p.is_file():
+                    continue
+                if use_3d:
+                    if p.suffix.lower() == ".npy":
+                        samples.append(Sample(image_path=p, label=label))
+                else:
+                    if p.suffix.lower() in IMG_EXTS:
+                        samples.append(Sample(image_path=p, label=label))
 
         if not samples:
             raise RuntimeError(
-                "No LIDC-IDRI samples discovered. Expect subfolders like normal/benign/malignant with images."
+                "No LIDC-IDRI samples discovered. Expect subfolders like normal/benign/malignant with images (2D) or .npy volumes (3D)."
             )
-        return cls(samples)
+        return cls(samples, use_3d=use_3d, depth_size=depth_size, volume_hw=volume_hw)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         sample = self.samples[idx]
+
+        if self.use_3d:
+            arr = np.load(sample.image_path).astype(np.float32)
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise ValueError(f"Unsupported LIDC-IDRI 3D array shape: {arr.shape}, path={sample.image_path}")
+
+            arr = arr - arr.min()
+            max_val = arr.max()
+            if max_val > 0:
+                arr = arr / max_val
+
+            tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.depth_size, self.volume_hw, self.volume_hw),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, sample.label
+
         img = Image.open(sample.image_path).convert("L")
         if self.transform is not None:
             img = self.transform(img)

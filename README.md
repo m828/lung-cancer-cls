@@ -27,6 +27,7 @@ lung-cancer-cls/
 ├── train_iqothnccd.py       # IQ-OTH/NCCD 快捷训练
 ├── train_luna16.py          # LUNA16 快捷训练
 ├── train_lidc_idri.py       # LIDC-IDRI 快捷训练
+├── prepare_lidc_idri_3d.py  # LIDC-IDRI 3D 预处理
 ├── prepare_luna16_slices.py # LUNA16 切片提取
 ├── requirements.txt          # 依赖
 └── TRAINING_GUIDE.md        # 统一训练框架使用说明
@@ -112,6 +113,21 @@ python train.py \
   --data-root /workspace/data-lung/lidc_idri_slices \
   --output-dir outputs/lidc_idri_train_val_only \
   --model resnet18 \
+  --split-mode train_val \
+  --epochs 30
+
+# LIDC-IDRI 3D 流程（先预处理再训练）
+python prepare_lidc_idri_3d.py \
+  --input-root /workspace/data-lung/lidc_idri_raw \
+  --output-root /workspace/data-lung/lidc_idri_3d_npy \
+  --depth-size 32 \
+  --image-size 128
+
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_3d_npy \
+  --output-dir outputs/lidc_idri_swin3d \
+  --model swin3d_tiny --pretrained \
   --split-mode train_val \
   --epochs 30
 ```

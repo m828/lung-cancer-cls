@@ -51,6 +51,7 @@ CLASS_NAME_TO_ID: Dict[str, int] = {
     "normal": 0,
     "benign": 1,
     "malignant": 2,
+    "abnormal": 1,  # 二分类时 abnormal 对应标签 1
 }
 
 ALIASES = {
@@ -62,15 +63,20 @@ ALIASES = {
     "malignant": "malignant",
     "m": "malignant",
     "cancer": "malignant",
+    "abnormal": "abnormal",
+    "a": "abnormal",
+    "benign or malignant": "abnormal",
     "normal cases": "normal",
     "benign cases": "benign",
     "malignant cases": "malignant",
+    "abnormal cases": "abnormal",
     "bengin": "benign",
     "bengin case": "benign",
     "bengin cases": "benign",
     "normal case": "normal",
     "benign case": "benign",
     "malignant case": "malignant",
+    "abnormal case": "abnormal",
 }
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -576,6 +582,27 @@ class IntranetCTDataset(BaseCTDataset):
                 arr = bundle_arr.astype(np.float32)
         else:
             arr = np.load(sample.image_path).astype(np.float32)
+
+        if self.use_3d:
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise ValueError(f"Unsupported CT array shape for 3D mode: {arr.shape}, path={sample.image_path}")
+
+            arr = arr - arr.min()
+            max_val = arr.max()
+            if max_val > 0:
+                arr = arr / max_val
+
+            tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.depth_size, 128, 128),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, sample.label
 
         if self.use_3d:
             if arr.ndim == 2:

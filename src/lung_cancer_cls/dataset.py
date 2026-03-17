@@ -51,6 +51,7 @@ CLASS_NAME_TO_ID: Dict[str, int] = {
     "normal": 0,
     "benign": 1,
     "malignant": 2,
+    "abnormal": 1,  # 二分类时 abnormal 对应标签 1
 }
 
 ALIASES = {
@@ -62,15 +63,20 @@ ALIASES = {
     "malignant": "malignant",
     "m": "malignant",
     "cancer": "malignant",
+    "abnormal": "abnormal",
+    "a": "abnormal",
+    "benign or malignant": "abnormal",
     "normal cases": "normal",
     "benign cases": "benign",
     "malignant cases": "malignant",
+    "abnormal cases": "abnormal",
     "bengin": "benign",
     "bengin case": "benign",
     "bengin cases": "benign",
     "normal case": "normal",
     "benign case": "benign",
     "malignant case": "malignant",
+    "abnormal case": "abnormal",
 }
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}

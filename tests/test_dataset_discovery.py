@@ -59,6 +59,32 @@ def test_luna16_raw_dir_without_extracted_slices_raises(tmp_path: Path):
         create_dataset(DatasetType.LUNA16, tmp_path)
 
 
+def test_lidc_idri_discovery(tmp_path: Path):
+    """测试 LIDC-IDRI 目录发现。"""
+    _write_img(tmp_path / "normal" / "n1.png")
+    _write_img(tmp_path / "benign" / "b1.png")
+    _write_img(tmp_path / "malignant" / "m1.png")
+
+    dataset = create_dataset(DatasetType.LIDC_IDRI, tmp_path)
+    samples = dataset.get_samples()
+    labels = sorted([s.label for s in samples])
+    assert labels == [0, 1, 2]
+
+
+def test_lidc_idri_3d_discovery_and_loading(tmp_path: Path):
+    import numpy as np
+
+    for cls_name in ["normal", "benign", "malignant"]:
+        d = tmp_path / cls_name
+        d.mkdir(parents=True, exist_ok=True)
+        np.save(d / f"{cls_name}.npy", np.random.randn(8, 16, 16).astype("float32"))
+
+    dataset = create_dataset(DatasetType.LIDC_IDRI, tmp_path, use_3d=True, depth_size=12)
+    x, y = dataset[0]
+    assert x.shape == (1, 12, 128, 128)
+    assert y in [0, 1, 2]
+
+
 def test_intranet_ct_discovery(tmp_path: Path):
     ct_root = tmp_path / "ct_root"
     ct_root.mkdir()
@@ -110,3 +136,33 @@ def test_intranet_ct_predefined_split_fallback(tmp_path: Path):
     )
     metrics = train_model(cfg)
     assert "test_acc" in metrics
+
+
+def test_intranet_ct_bundle_discovery(tmp_path: Path):
+    import numpy as np
+
+    processed = tmp_path / "processed"
+    processed.mkdir(parents=True)
+    np.save(processed / "NM_all.npy", np.random.randn(3, 16, 16).astype("float32"))
+    np.save(processed / "BN_all.npy", np.random.randn(2, 16, 16).astype("float32"))
+    np.save(processed / "MT_all.npy", np.random.randn(4, 16, 16).astype("float32"))
+
+    ds_bundle = create_dataset(DatasetType.INTRANET_CT, tmp_path, intranet_source="bundle")
+    assert len(ds_bundle.get_samples()) == 9
+
+    ct_root = tmp_path / "ct_root"
+    ct_root.mkdir(parents=True)
+    np.save(ct_root / "a.npy", np.random.randn(16, 16).astype("float32"))
+    meta = tmp_path / "meta.csv"
+    pd.DataFrame([
+        {"CT_numpy_cloud路径": "a.npy", "样本类型": "肺癌", "CT_train_val_split": "train"},
+    ]).to_csv(meta, index=False)
+
+    ds_both = create_dataset(
+        DatasetType.INTRANET_CT,
+        tmp_path,
+        intranet_source="both",
+        metadata_csv=meta,
+        ct_root=ct_root,
+    )
+    assert len(ds_both.get_samples()) == 10

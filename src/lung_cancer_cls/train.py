@@ -5,6 +5,7 @@ import json
 import random
 from collections import defaultdict
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple, Any
 
@@ -67,6 +68,14 @@ class TrainConfig:
     mask_loss_weight: float = 0.5
     consistency_weight: float = 0.1
     use_mask_guided_input: bool = False
+    intranet_source: str = "csv"
+    bundle_nm_path: Path | None = None
+    bundle_bn_path: Path | None = None
+    bundle_mt_path: Path | None = None
+    two_stage_bundle_to_csv: bool = False
+    finetune_epochs: int = 10
+    finetune_lr: float = 1e-4
+    init_checkpoint: Path | None = None
 
 
 def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -301,6 +310,13 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 dataset_kwargs["metadata_csv"] = config.metadata_csv
             if config.ct_root is not None:
                 dataset_kwargs["ct_root"] = config.ct_root
+            dataset_kwargs["intranet_source"] = config.intranet_source
+            if config.bundle_nm_path is not None:
+                dataset_kwargs["bundle_nm_path"] = config.bundle_nm_path
+            if config.bundle_bn_path is not None:
+                dataset_kwargs["bundle_bn_path"] = config.bundle_bn_path
+            if config.bundle_mt_path is not None:
+                dataset_kwargs["bundle_mt_path"] = config.bundle_mt_path
         if config.dataset_type == DatasetType.LIDC_IDRI and use_3d:
             dataset_kwargs["use_3d"] = True
             dataset_kwargs["depth_size"] = config.depth_size
@@ -499,6 +515,10 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         num_classes=3,
         pretrained=config.pretrained,
     ).to(device)
+    if config.init_checkpoint is not None and config.init_checkpoint.exists():
+        state = torch.load(config.init_checkpoint, map_location=device)
+        model.load_state_dict(state, strict=False)
+        print(f"加载初始权重: {config.init_checkpoint}")
 
     optimizer = create_optimizer(
         config.optimizer_name,
@@ -620,6 +640,14 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "mask_loss_weight": config.mask_loss_weight,
             "consistency_weight": config.consistency_weight,
             "use_mask_guided_input": config.use_mask_guided_input,
+            "intranet_source": config.intranet_source,
+            "bundle_nm_path": str(config.bundle_nm_path) if config.bundle_nm_path else None,
+            "bundle_bn_path": str(config.bundle_bn_path) if config.bundle_bn_path else None,
+            "bundle_mt_path": str(config.bundle_mt_path) if config.bundle_mt_path else None,
+            "two_stage_bundle_to_csv": config.two_stage_bundle_to_csv,
+            "finetune_epochs": config.finetune_epochs,
+            "finetune_lr": config.finetune_lr,
+            "init_checkpoint": str(config.init_checkpoint) if config.init_checkpoint else None,
         }
     }
 
@@ -635,6 +663,51 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print("=" * 60)
 
     return metrics
+
+
+def train_bundle_then_finetune_csv(config: TrainConfig) -> Dict[str, Any]:
+    """先用 bundle 三文件预训练，再用 csv 索引数据微调。"""
+    if config.dataset_type != DatasetType.INTRANET_CT:
+        raise ValueError("two-stage bundle->csv 仅支持 intranet_ct")
+
+    stage1_cfg = replace(
+        config,
+        intranet_source="bundle",
+        output_dir=config.output_dir / "stage1_bundle_pretrain",
+        use_predefined_split=False,
+        init_checkpoint=None,
+    )
+    print("\n" + "#" * 60)
+    print("Stage-1: 使用 processed/NM_all.npy + BN_all.npy + MT_all.npy 预训练")
+    print("#" * 60)
+    stage1_metrics = train_model(stage1_cfg)
+
+    stage1_ckpt = stage1_cfg.output_dir / "best_model.pt"
+    if not stage1_ckpt.exists():
+        raise RuntimeError(f"Stage-1 未找到最佳权重: {stage1_ckpt}")
+
+    stage2_cfg = replace(
+        config,
+        intranet_source="csv",
+        output_dir=config.output_dir / "stage2_csv_finetune",
+        epochs=config.finetune_epochs,
+        lr=config.finetune_lr,
+        init_checkpoint=stage1_ckpt,
+    )
+    print("\n" + "#" * 60)
+    print("Stage-2: 使用多模态统一检索表对应数据微调")
+    print("#" * 60)
+    stage2_metrics = train_model(stage2_cfg)
+
+    summary = {
+        "two_stage": True,
+        "stage1": stage1_metrics,
+        "stage2": stage2_metrics,
+        "stage1_checkpoint": str(stage1_ckpt),
+    }
+    with open(config.output_dir / "two_stage_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    return summary
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -660,6 +733,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-csv", type=str, default=None, help="内网数据索引 CSV 路径")
     parser.add_argument("--ct-root", type=str, default=None, help="内网 CT .npy 根目录")
     parser.add_argument("--use-predefined-split", action="store_true", help="使用索引表中的 train/val/test 划分")
+    parser.add_argument("--intranet-source", type=str, choices=["csv", "bundle", "both"], default="csv", help="内网数据来源：csv / bundle / both")
+    parser.add_argument("--bundle-nm-path", type=str, default="/home/apulis-dev/userdata/processed/NM_all.npy", help="NM_all.npy 路径")
+    parser.add_argument("--bundle-bn-path", type=str, default="/home/apulis-dev/userdata/processed/BN_all.npy", help="BN_all.npy 路径")
+    parser.add_argument("--bundle-mt-path", type=str, default="/home/apulis-dev/userdata/processed/MT_all.npy", help="MT_all.npy 路径")
+    parser.add_argument("--two-stage-bundle-to-csv", action="store_true", help="先 bundle 预训练，再 csv 微调")
+    parser.add_argument("--finetune-epochs", type=int, default=10, help="二阶段微调轮数")
+    parser.add_argument("--finetune-lr", type=float, default=1e-4, help="二阶段微调学习率")
     parser.add_argument("--mask-txt", type=str, default=None, help="mask-aware txt 列表（每行: mask_path image_path [label]）")
 
     # 训练参数
@@ -823,9 +903,18 @@ def main():
         ct_root=Path(args.ct_root) if args.ct_root else None,
         use_predefined_split=args.use_predefined_split,
         mask_txt=Path(args.mask_txt) if args.mask_txt else None,
+        intranet_source=args.intranet_source,
+        bundle_nm_path=Path(args.bundle_nm_path) if args.bundle_nm_path else None,
+        bundle_bn_path=Path(args.bundle_bn_path) if args.bundle_bn_path else None,
+        bundle_mt_path=Path(args.bundle_mt_path) if args.bundle_mt_path else None,
+        two_stage_bundle_to_csv=args.two_stage_bundle_to_csv,
+        finetune_epochs=args.finetune_epochs,
+        finetune_lr=args.finetune_lr,
     )
-
-    train_model(config)
+    if config.two_stage_bundle_to_csv:
+        train_bundle_then_finetune_csv(config)
+    else:
+        train_model(config)
 
 
 if __name__ == "__main__":

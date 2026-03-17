@@ -464,6 +464,8 @@ INTRANET_LABEL_MAP: Dict[str, int] = {
 class IntranetCTDataset(BaseCTDataset):
     """内网 CT 三分类数据集（基于索引表读取 .npy）"""
 
+    _bundle_cache: Dict[str, np.ndarray] = {}
+
     def __init__(
         self,
         samples: Sequence[Sample],
@@ -491,6 +493,23 @@ class IntranetCTDataset(BaseCTDataset):
             label_col: 标签列名（默认 "样本类型"）
             split_col: 划分列名（默认 "CT_train_val_split"）
         """
+        source = str(kwargs.get("intranet_source", "csv")).lower().strip()
+
+        if source == "csv":
+            samples = cls._discover_from_csv(root, **kwargs)
+        elif source == "bundle":
+            samples = cls._discover_from_bundles(root, **kwargs)
+        elif source == "both":
+            samples = cls._discover_from_csv(root, **kwargs) + cls._discover_from_bundles(root, **kwargs)
+        else:
+            raise ValueError(f"Unknown intranet_source: {source}")
+
+        if not samples:
+            raise RuntimeError("No valid intranet CT samples discovered")
+        return cls(samples)
+
+    @classmethod
+    def _discover_from_csv(cls, root: Path, **kwargs) -> List[Sample]:
         import pandas as pd
 
         metadata_csv = Path(kwargs.get("metadata_csv", root / "多模态统一检索表_CT本地路径_CT划分.csv"))
@@ -500,47 +519,90 @@ class IntranetCTDataset(BaseCTDataset):
         split_col = kwargs.get("split_col", "CT_train_val_split")
 
         if not metadata_csv.exists():
-            raise FileNotFoundError(f"Metadata CSV not found: {metadata_csv}")
+            return []
         if not ct_root.exists():
-            raise FileNotFoundError(f"CT root not found: {ct_root}")
+            return []
 
         df = pd.read_csv(metadata_csv).fillna("PANDASNAN")
         samples: List[Sample] = []
-
         for _, row in df.iterrows():
             label_name = str(row.get(label_col, "")).strip()
             if label_name not in INTRANET_LABEL_MAP:
                 continue
             label = INTRANET_LABEL_MAP[label_name]
-
             ct_rel = row.get(ct_path_col, "PANDASNAN")
             if ct_rel == "PANDASNAN":
                 continue
-
             rel_path = str(ct_rel).replace("\\", "/").lstrip("/")
             ct_path = ct_root / rel_path
             if not ct_path.exists():
                 continue
-
             split = str(row.get(split_col, "")).strip().lower()
-            samples.append(
-                Sample(
-                    image_path=ct_path,
-                    label=label,
-                    metadata={"split": split} if split else None,
-                )
-            )
+            samples.append(Sample(image_path=ct_path, label=label, metadata={"split": split} if split else None))
+        return samples
 
-        if not samples:
-            raise RuntimeError("No valid intranet CT samples discovered from metadata table")
-        return cls(samples)
+    @classmethod
+    def _discover_from_bundles(cls, root: Path, **kwargs) -> List[Sample]:
+        nm_path = Path(kwargs.get("bundle_nm_path", root / "processed/NM_all.npy"))
+        bn_path = Path(kwargs.get("bundle_bn_path", root / "processed/BN_all.npy"))
+        mt_path = Path(kwargs.get("bundle_mt_path", root / "processed/MT_all.npy"))
+
+        mapping = [(nm_path, 0), (bn_path, 1), (mt_path, 2)]
+        samples: List[Sample] = []
+        for p, label in mapping:
+            if not p.exists():
+                continue
+            arr = np.load(p, mmap_mode="r")
+            n = int(arr.shape[0]) if arr.ndim >= 3 else 1
+            for i in range(n):
+                samples.append(
+                    Sample(
+                        image_path=p,
+                        label=label,
+                        metadata={"bundle_path": str(p), "bundle_index": i},
+                    )
+                )
+        return samples
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
         sample = self.samples[idx]
-        arr = np.load(sample.image_path).astype(np.float32)
+        arr: np.ndarray
+        if sample.metadata is not None and "bundle_path" in sample.metadata:
+            bundle_path = str(sample.metadata["bundle_path"])
+            bundle_index = int(sample.metadata.get("bundle_index", 0))
+            if bundle_path not in self._bundle_cache:
+                self._bundle_cache[bundle_path] = np.load(bundle_path)
+            bundle_arr = self._bundle_cache[bundle_path]
+            if bundle_arr.ndim >= 3:
+                arr = bundle_arr[bundle_index].astype(np.float32)
+            else:
+                arr = bundle_arr.astype(np.float32)
+        else:
+            arr = np.load(sample.image_path).astype(np.float32)
+
+        if self.use_3d:
+            if arr.ndim == 2:
+                arr = arr[None, ...]
+            elif arr.ndim != 3:
+                raise ValueError(f"Unsupported CT array shape for 3D mode: {arr.shape}, path={sample.image_path}")
+
+            arr = arr - arr.min()
+            max_val = arr.max()
+            if max_val > 0:
+                arr = arr / max_val
+
+            tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(0),
+                size=(self.depth_size, 128, 128),
+                mode="trilinear",
+                align_corners=False,
+            ).squeeze(0)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, sample.label
 
         if self.use_3d:
             if arr.ndim == 2:

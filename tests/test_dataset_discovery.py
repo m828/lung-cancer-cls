@@ -136,3 +136,33 @@ def test_intranet_ct_predefined_split_fallback(tmp_path: Path):
     )
     metrics = train_model(cfg)
     assert "test_acc" in metrics
+
+
+def test_intranet_ct_bundle_discovery(tmp_path: Path):
+    import numpy as np
+
+    processed = tmp_path / "processed"
+    processed.mkdir(parents=True)
+    np.save(processed / "NM_all.npy", np.random.randn(3, 16, 16).astype("float32"))
+    np.save(processed / "BN_all.npy", np.random.randn(2, 16, 16).astype("float32"))
+    np.save(processed / "MT_all.npy", np.random.randn(4, 16, 16).astype("float32"))
+
+    ds_bundle = create_dataset(DatasetType.INTRANET_CT, tmp_path, intranet_source="bundle")
+    assert len(ds_bundle.get_samples()) == 9
+
+    ct_root = tmp_path / "ct_root"
+    ct_root.mkdir(parents=True)
+    np.save(ct_root / "a.npy", np.random.randn(16, 16).astype("float32"))
+    meta = tmp_path / "meta.csv"
+    pd.DataFrame([
+        {"CT_numpy_cloud路径": "a.npy", "样本类型": "肺癌", "CT_train_val_split": "train"},
+    ]).to_csv(meta, index=False)
+
+    ds_both = create_dataset(
+        DatasetType.INTRANET_CT,
+        tmp_path,
+        intranet_source="both",
+        metadata_csv=meta,
+        ct_root=ct_root,
+    )
+    assert len(ds_both.get_samples()) == 10

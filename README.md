@@ -172,6 +172,13 @@ python train.py \
 | `--metadata-csv` | 内网索引表 CSV 路径 | `data-root/多模态统一检索表_CT本地路径_CT划分.csv` |
 | `--ct-root` | CT `.npy` 根目录 | `data-root` |
 | `--use-predefined-split` | 使用 CSV 中的 `train/val/test` 划分 | False |
+| `--intranet-source` | 内网数据来源：`csv` / `bundle` / `both` | csv |
+| `--bundle-nm-path` | processed 正常样本 NPY 路径 | `/home/apulis-dev/userdata/processed/NM_all.npy` |
+| `--bundle-bn-path` | processed 良性样本 NPY 路径 | `/home/apulis-dev/userdata/processed/BN_all.npy` |
+| `--bundle-mt-path` | processed 恶性样本 NPY 路径 | `/home/apulis-dev/userdata/processed/MT_all.npy` |
+| `--two-stage-bundle-to-csv` | 两阶段：先 bundle 预训练再 csv 微调 | False |
+| `--finetune-epochs` | 两阶段微调轮数 | 10 |
+| `--finetune-lr` | 两阶段微调学习率 | 1e-4 |
 | `--mask-txt` | mask-aware 样本列表（每行：`mask_path image_path [label]`） | None |
 | `--use-3d-input` | 启用 3D 体输入（仅内网 `.npy`） | False |
 | `--depth-size` | 3D 输入重采样深度 | 32 |
@@ -189,6 +196,42 @@ python train.py \
   --model resnet18 \
   --split-mode train_val \
   --epochs 30
+
+# 方式1：仅使用 processed/NM_all.npy、BN_all.npy、MT_all.npy 训练
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /home/apulis-dev/userdata \
+  --intranet-source bundle \
+  --bundle-nm-path /home/apulis-dev/userdata/processed/NM_all.npy \
+  --bundle-bn-path /home/apulis-dev/userdata/processed/BN_all.npy \
+  --bundle-mt-path /home/apulis-dev/userdata/processed/MT_all.npy \
+  --output-dir outputs/intranet_bundle_only \
+  --model resnet18 \
+  --split-mode train_val
+
+# 方式2：bundle + CSV 索引数据联合训练
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /home/apulis-dev/userdata \
+  --intranet-source both \
+  --metadata-csv /home/apulis-dev/userdata/mmy/ct/多模态统一检索表_CT本地路径_CT划分.csv \
+  --ct-root /home/apulis-dev/userdata/Data/CT1500 \
+  --output-dir outputs/intranet_bundle_plus_csv \
+  --model resnet18_cbam \
+  --split-mode train_val
+
+# 方式3：先 bundle 预训练，再用 CSV 数据微调
+python train.py \
+  --dataset-type intranet_ct \
+  --data-root /home/apulis-dev/userdata \
+  --two-stage-bundle-to-csv \
+  --metadata-csv /home/apulis-dev/userdata/mmy/ct/多模态统一检索表_CT本地路径_CT划分.csv \
+  --ct-root /home/apulis-dev/userdata/Data/CT1500 \
+  --output-dir outputs/intranet_two_stage \
+  --model resnet18 \
+  --epochs 30 \
+  --finetune-epochs 10 \
+  --finetune-lr 1e-4
 ```
 
 ## 6. 训练结果

@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torchvision import models
 
+import monai
+
 
 class SEModule(nn.Module):
     """Squeeze-and-Excitation 通道注意力模块。"""
@@ -406,6 +408,15 @@ class DenseNet3DCTClassifier(nn.Module):
         x = self.head(x).flatten(1)
         return self.classifier(x)
 
+class DenseNet3D_121(nn.Module):
+    """Monai DenseNet121 3D用于CT体数据分类"""
+    def __init__(self, num_classes: int = 3):
+        super().__init__()
+        self.backbone = monai.networks.nets.DenseNet121(
+            spatial_dims=3, n_input_channels=1, out_channels=num_classes
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
 
 def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False) -> nn.Module:
     """模型工厂，便于脚本化组合和消融。"""
@@ -433,6 +444,8 @@ def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False)
         return Swin3DTinyCTClassifier(num_classes=num_classes, pretrained=pretrained)
     if name == "densenet3d":
         return DenseNet3DCTClassifier(num_classes=num_classes)
+    if name == "densenet3d_121":
+        return DenseNet3D_121(num_classes=num_classes)
     if name == "attention3d_cnn":
         return Attention3DCNNClassifier(num_classes=num_classes)
 

@@ -294,7 +294,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print(f"输出目录: {config.output_dir}")
     print("=" * 60)
 
-    auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "attention3d_cnn"}
+    auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "densenet3d_121", "attention3d_cnn"}
     use_3d = config.use_3d_input or config.model in auto_3d_models
 
     # 1. 创建数据集
@@ -798,6 +798,7 @@ def build_parser() -> argparse.ArgumentParser:
             "r2plus1d_18",
             "swin3d_tiny",
             "densenet3d",
+            "densenet3d_121",
             "attention3d_cnn",
         ],
         default="simple", help="模型架构 (默认: simple)"

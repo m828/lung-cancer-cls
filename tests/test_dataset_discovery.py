@@ -166,3 +166,56 @@ def test_intranet_ct_bundle_discovery(tmp_path: Path):
         ct_root=ct_root,
     )
     assert len(ds_both.get_samples()) == 10
+
+
+def test_intranet_ct_3d_volume_hw(tmp_path: Path):
+    import numpy as np
+
+    processed = tmp_path / "processed"
+    processed.mkdir(parents=True)
+    np.save(processed / "NM_all.npy", np.random.randn(2, 8, 16, 16).astype("float32"))
+    np.save(processed / "BN_all.npy", np.random.randn(2, 8, 16, 16).astype("float32"))
+    np.save(processed / "MT_all.npy", np.random.randn(2, 8, 16, 16).astype("float32"))
+
+    dataset = create_dataset(
+        DatasetType.INTRANET_CT,
+        tmp_path,
+        intranet_source="bundle",
+        use_3d=True,
+        depth_size=10,
+        volume_hw=64,
+    )
+    x, y = dataset[0]
+    assert x.shape == (1, 10, 64, 64)
+    assert y in [0, 1, 2]
+
+
+def test_binary_class_mode_train_smoke(tmp_path: Path):
+    import numpy as np
+
+    for cls_name in ["normal", "benign", "malignant"]:
+        d = tmp_path / cls_name
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(2):
+            np.save(d / f"{cls_name}_{idx}.npy", np.random.randn(8, 16, 16).astype("float32"))
+
+    cfg = TrainConfig(
+        dataset_type=DatasetType.LIDC_IDRI,
+        data_root=tmp_path,
+        output_dir=tmp_path / "out_binary",
+        epochs=1,
+        batch_size=2,
+        num_workers=0,
+        cpu=True,
+        use_3d_input=True,
+        depth_size=8,
+        volume_hw=32,
+        model="attention3d_cnn",
+        class_mode="binary",
+        binary_task="malignant_vs_rest",
+        split_mode="train_val",
+    )
+    metrics = train_model(cfg)
+    assert metrics["config"]["class_mode"] == "binary"
+    assert metrics["config"]["binary_task"] == "malignant_vs_rest"
+    assert metrics["class_names"] == {0: "non_malignant", 1: "malignant"}

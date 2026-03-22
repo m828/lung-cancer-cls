@@ -191,6 +191,81 @@ class DataGenerator(Dataset):
         return img, sample.label, mask
 
 
+class Compose3D:
+    """Compose tensor-to-tensor transforms for 3D volumes."""
+
+    def __init__(self, transforms: Sequence[Callable[[torch.Tensor], torch.Tensor]]):
+        self.transforms = list(transforms)
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        for transform in self.transforms:
+            tensor = transform(tensor)
+        return tensor
+
+
+class RandomFlip3D:
+    """Randomly flip a [C, D, H, W] tensor along one spatial axis."""
+
+    def __init__(self, dim: int, p: float = 0.5):
+        self.dim = dim
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.p:
+            tensor = torch.flip(tensor, dims=(self.dim,))
+        return tensor
+
+
+class RandomRotate90Axial3D:
+    """Random 90-degree rotation in the axial plane."""
+
+    def __init__(self, p: float = 0.25):
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.p:
+            k = int(torch.randint(1, 4, (1,)).item())
+            tensor = torch.rot90(tensor, k=k, dims=(2, 3))
+        return tensor
+
+
+class RandomIntensityJitter3D:
+    """Apply mild intensity scale/shift jitter after normalization."""
+
+    def __init__(
+        self,
+        scale_range: Tuple[float, float] = (0.95, 1.05),
+        shift_range: Tuple[float, float] = (-0.05, 0.05),
+        p: float = 0.3,
+    ):
+        self.scale_range = scale_range
+        self.shift_range = shift_range
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() >= self.p:
+            return tensor
+
+        scale = torch.empty(1).uniform_(*self.scale_range).item()
+        shift = torch.empty(1).uniform_(*self.shift_range).item()
+        tensor = tensor * scale + shift
+        return tensor.clamp_(-1.5, 1.5)
+
+
+class RandomGaussianNoise3D:
+    """Add low-variance Gaussian noise to a 3D tensor."""
+
+    def __init__(self, std: float = 0.03, p: float = 0.2):
+        self.std = std
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() >= self.p:
+            return tensor
+        noise = torch.randn_like(tensor) * self.std
+        return (tensor + noise).clamp_(-1.5, 1.5)
+
+
 # ======================================
 # IQ-OTH/NCCD 数据集
 # ======================================
@@ -442,6 +517,8 @@ class LIDCIDRIDataset(BaseCTDataset):
                 align_corners=False,
             ).squeeze(0)
             tensor = (tensor - 0.5) / 0.5
+            if self.transform is not None:
+                tensor = self.transform(tensor)
             return tensor, sample.label
 
         img = Image.open(sample.image_path).convert("L")
@@ -472,11 +549,13 @@ class IntranetCTDataset(BaseCTDataset):
         transform: Callable | None = None,
         use_3d: bool = False,
         depth_size: int = 32,
+        volume_hw: int = 128,
     ):
         self.samples = list(samples)
         self.transform = transform
         self.use_3d = use_3d
         self.depth_size = depth_size
+        self.volume_hw = volume_hw
 
     def get_samples(self) -> List[Sample]:
         return self.samples
@@ -494,6 +573,9 @@ class IntranetCTDataset(BaseCTDataset):
             split_col: 划分列名（默认 "CT_train_val_split"）
         """
         source = str(kwargs.get("intranet_source", "csv")).lower().strip()
+        use_3d = bool(kwargs.get("use_3d", False))
+        depth_size = int(kwargs.get("depth_size", 32))
+        volume_hw = int(kwargs.get("volume_hw", 128))
 
         if source == "csv":
             samples = cls._discover_from_csv(root, **kwargs)
@@ -506,7 +588,7 @@ class IntranetCTDataset(BaseCTDataset):
 
         if not samples:
             raise RuntimeError("No valid intranet CT samples discovered")
-        return cls(samples)
+        return cls(samples, use_3d=use_3d, depth_size=depth_size, volume_hw=volume_hw)
 
     @classmethod
     def _discover_from_csv(cls, root: Path, **kwargs) -> List[Sample]:
@@ -597,11 +679,13 @@ class IntranetCTDataset(BaseCTDataset):
             tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, D, H, W]
             tensor = torch.nn.functional.interpolate(
                 tensor.unsqueeze(0),
-                size=(self.depth_size, 128, 128),
+                size=(self.depth_size, self.volume_hw, self.volume_hw),
                 mode="trilinear",
                 align_corners=False,
             ).squeeze(0)
             tensor = (tensor - 0.5) / 0.5
+            if self.transform is not None:
+                tensor = self.transform(tensor)
             return tensor, sample.label
 
         # 兼容 3D 体数据：取中间层作为 2D 输入
@@ -699,3 +783,32 @@ def get_default_transforms(
             transforms.Normalize(mean=[0.5], std=[0.3]),
         ])
     return train_tf, val_test_tf
+
+
+def get_default_volume_transforms(
+    aug_profile: str = "basic",
+) -> Tuple[Callable[[torch.Tensor], torch.Tensor], Callable[[torch.Tensor], torch.Tensor]]:
+    """Default tensor transforms for [C, D, H, W] CT volumes."""
+
+    profile = aug_profile.lower().strip()
+    train_transforms: List[Callable[[torch.Tensor], torch.Tensor]] = [
+        RandomFlip3D(dim=3, p=0.5),
+        RandomFlip3D(dim=2, p=0.5),
+        RandomRotate90Axial3D(p=0.2),
+    ]
+
+    if profile == "strong":
+        train_transforms.extend(
+            [
+                RandomFlip3D(dim=1, p=0.2),
+                RandomIntensityJitter3D(scale_range=(0.9, 1.1), shift_range=(-0.1, 0.1), p=0.5),
+                RandomGaussianNoise3D(std=0.04, p=0.3),
+            ]
+        )
+    else:
+        train_transforms.append(
+            RandomIntensityJitter3D(scale_range=(0.95, 1.05), shift_range=(-0.05, 0.05), p=0.2)
+        )
+
+    identity = Compose3D([])
+    return Compose3D(train_transforms), identity

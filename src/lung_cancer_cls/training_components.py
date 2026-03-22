@@ -8,6 +8,19 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def _build_cross_entropy_loss(
+    class_weights: torch.Tensor | None = None,
+    label_smoothing: float = 0.0,
+) -> nn.Module:
+    kwargs = {"weight": class_weights}
+    if label_smoothing > 0:
+        try:
+            return nn.CrossEntropyLoss(label_smoothing=label_smoothing, **kwargs)
+        except TypeError:
+            pass
+    return nn.CrossEntropyLoss(**kwargs)
+
+
 class FocalLoss(nn.Module):
     """多分类 Focal Loss，适合类别不均衡。"""
 
@@ -57,7 +70,7 @@ class MaskAwareClassificationLoss(nn.Module):
         consistency_weight: float = 0.1,
     ):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        self.ce = _build_cross_entropy_loss(class_weights=class_weights, label_smoothing=label_smoothing)
         self.mask_loss_weight = mask_loss_weight
         self.consistency_weight = consistency_weight
 
@@ -116,7 +129,7 @@ def create_loss(
 ) -> nn.Module:
     name = loss_name.lower().strip()
     if name == "ce":
-        return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        return _build_cross_entropy_loss(class_weights=class_weights, label_smoothing=label_smoothing)
     if name == "focal":
         return FocalLoss(gamma=focal_gamma, alpha=class_weights)
     if name == "mask_aware":

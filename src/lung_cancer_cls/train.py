@@ -20,6 +20,7 @@ from lung_cancer_cls.dataset import (
     Sample,
     create_dataset,
     get_default_transforms,
+    get_default_volume_transforms,
     DataGenerator,
 )
 from lung_cancer_cls.model import build_model
@@ -64,10 +65,13 @@ class TrainConfig:
     use_predefined_split: bool = False
     use_3d_input: bool = False
     depth_size: int = 32
+    volume_hw: int = 128
     mask_txt: Path | None = None
     mask_loss_weight: float = 0.5
     consistency_weight: float = 0.1
     use_mask_guided_input: bool = False
+    class_mode: str = "multiclass"
+    binary_task: str = "malignant_vs_rest"
     intranet_source: str = "csv"
     bundle_nm_path: Path | None = None
     bundle_bn_path: Path | None = None
@@ -76,6 +80,47 @@ class TrainConfig:
     finetune_epochs: int = 10
     finetune_lr: float = 1e-4
     init_checkpoint: Path | None = None
+
+
+MULTICLASS_NAMES = {
+    0: "normal",
+    1: "benign",
+    2: "malignant",
+}
+
+
+def remap_samples_by_class_mode(
+    samples: Sequence[Sample],
+    class_mode: str,
+    binary_task: str,
+) -> Tuple[List[Sample], Dict[int, str]]:
+    """Optionally collapse three-class labels into a binary task."""
+
+    mode = class_mode.lower().strip()
+    if mode == "multiclass":
+        return list(samples), dict(MULTICLASS_NAMES)
+
+    if mode != "binary":
+        raise ValueError(f"Unknown class_mode: {class_mode}")
+
+    task = binary_task.lower().strip()
+    if task == "abnormal_vs_normal":
+        class_names = {0: "normal", 1: "abnormal"}
+
+        def remap(label: int) -> int:
+            return 0 if label == 0 else 1
+
+    elif task == "malignant_vs_rest":
+        class_names = {0: "non_malignant", 1: "malignant"}
+
+        def remap(label: int) -> int:
+            return 1 if label == 2 else 0
+
+    else:
+        raise ValueError(f"Unknown binary_task: {binary_task}")
+
+    remapped = [replace(sample, label=remap(sample.label)) for sample in samples]
+    return remapped, class_names
 
 
 def unpack_batch(batch: Any) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -317,21 +362,28 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 dataset_kwargs["bundle_bn_path"] = config.bundle_bn_path
             if config.bundle_mt_path is not None:
                 dataset_kwargs["bundle_mt_path"] = config.bundle_mt_path
-        if config.dataset_type == DatasetType.LIDC_IDRI and use_3d:
+        if config.dataset_type in {DatasetType.LIDC_IDRI, DatasetType.INTRANET_CT} and use_3d:
             dataset_kwargs["use_3d"] = True
             dataset_kwargs["depth_size"] = config.depth_size
+            dataset_kwargs["volume_hw"] = config.volume_hw
         full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
         samples = full_dataset.get_samples()
-    print(f"找到 {len(samples)} 个样本")
+    samples, class_names = remap_samples_by_class_mode(
+        samples,
+        class_mode=config.class_mode,
+        binary_task=config.binary_task,
+    )
+    num_classes = len(class_names)
+    print(f"Found {len(samples)} samples")
 
     # 打印类别分布
     label_counts = defaultdict(int)
     for s in samples:
         label_counts[s.label] += 1
     print("类别分布:")
-    for label in sorted(label_counts.keys()):
-        class_name = ["normal", "benign", "malignant"][label]
-        print(f"  {class_name} (label={label}): {label_counts[label]}")
+    for label in range(num_classes):
+        class_name = class_names.get(label, f"class_{label}")
+        print(f"  {class_name} (label={label}): {label_counts.get(label, 0)}")
 
     # 2. 数据划分
     if config.split_mode == "train_val":
@@ -377,6 +429,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     train_tf, val_test_tf = get_default_transforms(
         config.dataset_type, config.image_size, aug_profile=config.aug_profile
     )
+    train_volume_tf, val_volume_tf = get_default_volume_transforms(config.aug_profile)
 
     # 4. 创建 DataLoader
     # 重新应用 transform（因为 create_dataset 返回的可能没有 transform）
@@ -384,9 +437,13 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     # 先获取样本列表，然后创建带 transform 的数据集
     from lung_cancer_cls.dataset import IQOTHNCCDDataset, LUNA16Dataset, LIDCIDRIDataset, IntranetCTDataset
     from torchvision import transforms
+    from PIL import Image
+
+    interpolation_mode = getattr(transforms, "InterpolationMode", None)
+    nearest_interp = interpolation_mode.NEAREST if interpolation_mode is not None else Image.NEAREST
 
     mask_tf = transforms.Compose([
-        transforms.Resize((config.image_size, config.image_size), interpolation=transforms.InterpolationMode.NEAREST),
+        transforms.Resize((config.image_size, config.image_size), interpolation=nearest_interp),
         transforms.ToTensor(),
     ])
 
@@ -415,18 +472,20 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             train_ds = Subset(
                 LIDCIDRIDataset(
                     samples,
-                    transform=None if use_3d else train_tf,
+                    transform=train_volume_tf if use_3d else train_tf,
                     use_3d=use_3d,
                     depth_size=config.depth_size,
+                    volume_hw=config.volume_hw,
                 ),
                 train_idx,
             )
             val_ds = Subset(
                 LIDCIDRIDataset(
                     samples,
-                    transform=None if use_3d else val_test_tf,
+                    transform=val_volume_tf if use_3d else val_test_tf,
                     use_3d=use_3d,
                     depth_size=config.depth_size,
+                    volume_hw=config.volume_hw,
                 ),
                 val_idx,
             )
@@ -434,9 +493,10 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 test_ds = Subset(
                     LIDCIDRIDataset(
                         samples,
-                        transform=None if use_3d else val_test_tf,
+                        transform=val_volume_tf if use_3d else val_test_tf,
                         use_3d=use_3d,
                         depth_size=config.depth_size,
+                        volume_hw=config.volume_hw,
                     ),
                     test_idx,
                 )
@@ -444,18 +504,20 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             train_ds = Subset(
                 IntranetCTDataset(
                     samples,
-                    transform=None if use_3d else train_tf,
+                    transform=train_volume_tf if use_3d else train_tf,
                     use_3d=use_3d,
                     depth_size=config.depth_size,
+                    volume_hw=config.volume_hw,
                 ),
                 train_idx,
             )
             val_ds = Subset(
                 IntranetCTDataset(
                     samples,
-                    transform=None if use_3d else val_test_tf,
+                    transform=val_volume_tf if use_3d else val_test_tf,
                     use_3d=use_3d,
                     depth_size=config.depth_size,
+                    volume_hw=config.volume_hw,
                 ),
                 val_idx,
             )
@@ -463,9 +525,10 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
                 test_ds = Subset(
                     IntranetCTDataset(
                         samples,
-                        transform=None if use_3d else val_test_tf,
+                        transform=val_volume_tf if use_3d else val_test_tf,
                         use_3d=use_3d,
                         depth_size=config.depth_size,
+                        volume_hw=config.volume_hw,
                     ),
                     test_idx,
                 )
@@ -476,7 +539,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     )
 
     # 数据不平衡处理：可选加权采样
-    train_label_counts = [0, 0, 0]
+    train_label_counts = [0 for _ in range(num_classes)]
     for i in train_idx:
         train_label_counts[samples[i].label] += 1
 
@@ -508,11 +571,14 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     # 5. 创建模型
     print(f"\n模型: {config.model} (pretrained={config.pretrained})")
-    print(f"训练集类别计数: normal={train_label_counts[0]}, benign={train_label_counts[1]}, malignant={train_label_counts[2]}")
+    label_summary = ", ".join(
+        f"{class_names[idx]}={train_label_counts[idx]}" for idx in range(num_classes)
+    )
+    print(f"训练集类别计数: {label_summary}")
     print(f"不平衡策略: sampler={config.sampling_strategy}, class_weight={config.class_weight_strategy}")
     model = build_model(
         config.model,
-        num_classes=3,
+        num_classes=num_classes,
         pretrained=config.pretrained,
     ).to(device)
     if config.init_checkpoint is not None and config.init_checkpoint.exists():
@@ -625,12 +691,15 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         "test_acc": test_acc,
         "test_loss": test_loss,
         "history": history,
+        "class_names": class_names,
         "config": {
             "image_size": config.image_size,
             "batch_size": config.batch_size,
             "epochs": config.epochs,
             "model": config.model,
             "pretrained": config.pretrained,
+            "class_mode": config.class_mode,
+            "binary_task": config.binary_task,
             "sampling_strategy": config.sampling_strategy,
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
@@ -640,6 +709,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "mask_loss_weight": config.mask_loss_weight,
             "consistency_weight": config.consistency_weight,
             "use_mask_guided_input": config.use_mask_guided_input,
+            "volume_hw": config.volume_hw,
             "intranet_source": config.intranet_source,
             "bundle_nm_path": str(config.bundle_nm_path) if config.bundle_nm_path else None,
             "bundle_bn_path": str(config.bundle_bn_path) if config.bundle_bn_path else None,
@@ -844,11 +914,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="损失函数类别权重策略"
     )
     parser.add_argument(
+        "--class-mode", type=str, choices=["multiclass", "binary"], default="multiclass",
+        help="分类任务模式：multiclass / binary"
+    )
+    parser.add_argument(
+        "--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal"], default="malignant_vs_rest",
+        help="二分类标签折叠方式"
+    )
+    parser.add_argument(
         "--effective-num-beta", type=float, default=0.999,
         help="effective_num 权重的 beta 参数"
     )
     parser.add_argument("--use-3d-input", action="store_true", help="启用 3D 体输入（仅内网 .npy）")
     parser.add_argument("--depth-size", type=int, default=32, help="3D 输入重采样深度")
+    parser.add_argument("--volume-hw", type=int, default=128, help="3D 输入重采样后的平面分辨率")
 
     return parser
 
@@ -897,9 +976,12 @@ def main():
         scheduler_name=args.scheduler,
         sampling_strategy=args.sampling_strategy,
         class_weight_strategy=args.class_weight_strategy,
+        class_mode=args.class_mode,
+        binary_task=args.binary_task,
         effective_num_beta=args.effective_num_beta,
         use_3d_input=args.use_3d_input,
         depth_size=args.depth_size,
+        volume_hw=args.volume_hw,
         metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
         ct_root=Path(args.ct_root) if args.ct_root else None,
         use_predefined_split=args.use_predefined_split,

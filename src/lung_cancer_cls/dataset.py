@@ -634,16 +634,21 @@ class IntranetCTDataset(BaseCTDataset):
         for p, label in mapping:
             if not p.exists():
                 continue
-            arr = np.load(p, mmap_mode="r")
-            n = int(arr.shape[0]) if arr.ndim >= 3 else 1
-            for i in range(n):
-                samples.append(
-                    Sample(
-                        image_path=p,
-                        label=label,
-                        metadata={"bundle_path": str(p), "bundle_index": i},
+            if p.is_dir():
+                npy_files = sorted(fp for fp in p.glob("*.npy") if fp.is_file())
+                for npy in npy_files:
+                    samples.append(Sample(image_path=npy, label=label))
+            else:
+                arr = np.load(p, mmap_mode="r")
+                n = int(arr.shape[0]) if arr.ndim >= 3 else 1
+                for i in range(n):
+                    samples.append(
+                        Sample(
+                            image_path=p,
+                            label=label,
+                            metadata={"bundle_path": str(p), "bundle_index": i},
+                        )
                     )
-                )
         return samples
 
     def __len__(self) -> int:

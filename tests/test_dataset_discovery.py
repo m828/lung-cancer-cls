@@ -190,6 +190,42 @@ def test_intranet_ct_3d_volume_hw(tmp_path: Path):
     assert y in [0, 1, 2]
 
 
+def test_intranet_ct_bundle_directory_discovery(tmp_path: Path):
+    import numpy as np
+
+    raw = tmp_path / "raw"
+    nm_dir = raw / "nm" / "npy_128_256_256_fix"
+    bn_dir = raw / "bn" / "npy_128_256_256"
+    mt_dir = raw / "mt" / "npy_128_256_256"
+    nm_dir.mkdir(parents=True)
+    bn_dir.mkdir(parents=True)
+    mt_dir.mkdir(parents=True)
+
+    np.save(nm_dir / "nm_0.npy", np.random.randn(8, 16, 16).astype("float32"))
+    np.save(nm_dir / "nm_1.npy", np.random.randn(8, 16, 16).astype("float32"))
+    np.save(bn_dir / "bn_0.npy", np.random.randn(8, 16, 16).astype("float32"))
+    np.save(mt_dir / "mt_0.npy", np.random.randn(8, 16, 16).astype("float32"))
+    np.save(mt_dir / "mt_1.npy", np.random.randn(8, 16, 16).astype("float32"))
+    np.save(mt_dir / "mt_2.npy", np.random.randn(8, 16, 16).astype("float32"))
+
+    ds = create_dataset(
+        DatasetType.INTRANET_CT,
+        tmp_path,
+        intranet_source="bundle",
+        bundle_nm_path=nm_dir,
+        bundle_bn_path=bn_dir,
+        bundle_mt_path=mt_dir,
+    )
+    samples = ds.get_samples()
+    assert len(samples) == 6
+    labels = sorted(s.label for s in samples)
+    assert labels == [0, 0, 1, 2, 2, 2]
+
+    x, y = ds[0]
+    assert y in [0, 1, 2]
+    assert tuple(x.shape[-2:]) == (224, 224)
+
+
 def test_binary_class_mode_train_smoke(tmp_path: Path):
     import numpy as np
 

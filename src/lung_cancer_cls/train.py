@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from dataclasses import replace
@@ -11,6 +13,16 @@ from typing import Dict, List, Sequence, Tuple, Any
 
 import numpy as np
 import torch
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from torch import nn
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
@@ -23,7 +35,6 @@ from lung_cancer_cls.dataset import (
     get_default_volume_transforms,
     DataGenerator,
 )
-from lung_cancer_cls.model import build_model
 from lung_cancer_cls.training_components import (
     MaskAwareClassificationLoss,
     build_class_weights,
@@ -72,6 +83,7 @@ class TrainConfig:
     use_mask_guided_input: bool = False
     class_mode: str = "multiclass"
     binary_task: str = "malignant_vs_rest"
+    selection_metric: str = "auto"
     intranet_source: str = "csv"
     bundle_nm_path: Path | None = None
     bundle_bn_path: Path | None = None
@@ -86,6 +98,16 @@ MULTICLASS_NAMES = {
     0: "normal",
     1: "benign",
     2: "malignant",
+}
+
+SELECTION_METRICS = {
+    "auto",
+    "accuracy",
+    "balanced_accuracy",
+    "auroc",
+    "auprc",
+    "f1",
+    "loss",
 }
 
 
@@ -115,6 +137,15 @@ def remap_samples_by_class_mode(
 
         def remap(label: int) -> int:
             return 1 if label == 2 else 0
+
+    elif task == "malignant_vs_normal":
+        class_names = {0: "normal", 1: "malignant"}
+        remapped = [
+            replace(sample, label=1 if sample.label == 2 else 0)
+            for sample in samples
+            if sample.label in {0, 2}
+        ]
+        return remapped, class_names
 
     else:
         raise ValueError(f"Unknown binary_task: {binary_task}")
@@ -246,18 +277,160 @@ def stratified_train_val_split(
     return train_idx, val_idx
 
 
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    value_f = float(value)
+    if math.isnan(value_f) or math.isinf(value_f):
+        return None
+    return value_f
+
+
+def _metric_with_fallback(func: Any, *args: Any, **kwargs: Any) -> float | None:
+    try:
+        return _safe_float(func(*args, **kwargs))
+    except ValueError:
+        return None
+
+
+def _format_metric(value: float | None) -> str:
+    return "nan" if value is None else f"{value:.4f}"
+
+
+def resolve_selection_metric(selection_metric: str, num_classes: int) -> str:
+    metric = selection_metric.lower().strip()
+    if metric not in SELECTION_METRICS:
+        raise ValueError(f"Unknown selection_metric: {selection_metric}")
+    if metric == "auto":
+        return "auroc" if num_classes == 2 else "balanced_accuracy"
+    return metric
+
+
+def get_selection_score(metrics: Dict[str, Any], metric_name: str) -> float | None:
+    value = _safe_float(metrics.get(metric_name))
+    if value is None:
+        return None
+    if metric_name == "loss":
+        return -value
+    return value
+
+
+def resolve_selection_score(metrics: Dict[str, Any], metric_name: str) -> Tuple[float, str]:
+    score = get_selection_score(metrics, metric_name)
+    if score is not None:
+        return score, metric_name
+
+    fallback_metric = "accuracy"
+    fallback_score = get_selection_score(metrics, fallback_metric)
+    if fallback_score is not None:
+        return fallback_score, fallback_metric
+
+    return -float("inf"), metric_name
+
+
+def build_epoch_log(metrics: Dict[str, Any]) -> Dict[str, float | None]:
+    keys = [
+        "loss",
+        "accuracy",
+        "balanced_accuracy",
+        "auroc",
+        "auprc",
+        "f1",
+        "precision",
+        "recall",
+        "sensitivity",
+        "specificity",
+        "brier_score",
+    ]
+    return {key: _safe_float(metrics.get(key)) for key in keys if key in metrics}
+
+
+def compute_classification_metrics(
+    y_true: np.ndarray,
+    probabilities: np.ndarray,
+    loss: float,
+    class_names: Dict[int, str],
+) -> Dict[str, Any]:
+    num_classes = probabilities.shape[1]
+    labels = list(range(num_classes))
+    predictions = probabilities.argmax(axis=1)
+
+    metrics: Dict[str, Any] = {
+        "loss": float(loss),
+        "accuracy": _safe_float(accuracy_score(y_true, predictions)),
+        "balanced_accuracy": _metric_with_fallback(balanced_accuracy_score, y_true, predictions),
+        "confusion_matrix": confusion_matrix(y_true, predictions, labels=labels).tolist(),
+        "num_samples": int(y_true.shape[0]),
+    }
+
+    if num_classes == 2:
+        positive_probs = probabilities[:, 1]
+        precision = precision_score(y_true, predictions, zero_division=0)
+        recall = recall_score(y_true, predictions, zero_division=0)
+        f1 = f1_score(y_true, predictions, zero_division=0)
+        tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+        specificity = None
+        if (tn + fp) > 0:
+            specificity = float(tn / (tn + fp))
+
+        metrics.update(
+            {
+                "auroc": _metric_with_fallback(roc_auc_score, y_true, positive_probs),
+                "auprc": _metric_with_fallback(average_precision_score, y_true, positive_probs),
+                "precision": _safe_float(precision),
+                "recall": _safe_float(recall),
+                "sensitivity": _safe_float(recall),
+                "specificity": specificity,
+                "f1": _safe_float(f1),
+                "brier_score": float(np.mean((positive_probs - y_true.astype(np.float32)) ** 2)),
+                "positive_class": class_names.get(1, "class_1"),
+                "negative_class": class_names.get(0, "class_0"),
+            }
+        )
+    else:
+        y_true_onehot = np.eye(num_classes, dtype=np.float32)[y_true]
+        metrics.update(
+            {
+                "auroc": _metric_with_fallback(
+                    roc_auc_score,
+                    y_true_onehot,
+                    probabilities,
+                    multi_class="ovr",
+                    average="macro",
+                ),
+                "auprc": _metric_with_fallback(
+                    average_precision_score,
+                    y_true_onehot,
+                    probabilities,
+                    average="macro",
+                ),
+                "precision_macro": _safe_float(
+                    precision_score(y_true, predictions, average="macro", zero_division=0)
+                ),
+                "recall_macro": _safe_float(
+                    recall_score(y_true, predictions, average="macro", zero_division=0)
+                ),
+                "f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
+            }
+        )
+
+    return metrics
+
+
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     criterion: nn.Module,
+    class_names: Dict[int, str],
     use_mask_guided_input: bool = False,
-) -> Tuple[float, float]:
+) -> Dict[str, Any]:
     """统一的评估函数"""
     model.eval()
     total_loss = 0.0
-    correct = 0
     total = 0
+    all_labels: List[torch.Tensor] = []
+    all_probabilities: List[torch.Tensor] = []
 
     with torch.no_grad():
         for batch in loader:
@@ -274,11 +447,36 @@ def evaluate(
             else:
                 loss = criterion(logits, y)
             total_loss += loss.item() * y.size(0)
-            pred = logits.argmax(dim=1)
-            correct += (pred == y).sum().item()
             total += y.size(0)
+            all_labels.append(y.detach().cpu())
+            all_probabilities.append(torch.softmax(logits, dim=1).detach().cpu())
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    if total == 0:
+        return {
+            "loss": None,
+            "accuracy": None,
+            "balanced_accuracy": None,
+            "auroc": None,
+            "auprc": None,
+            "f1": None,
+            "precision": None,
+            "recall": None,
+            "sensitivity": None,
+            "specificity": None,
+            "brier_score": None,
+            "confusion_matrix": [],
+            "num_samples": 0,
+        }
+
+    y_true_np = torch.cat(all_labels).numpy().astype(np.int64)
+    probabilities_np = torch.cat(all_probabilities).numpy()
+    average_loss = total_loss / max(total, 1)
+    return compute_classification_metrics(
+        y_true_np,
+        probabilities_np,
+        loss=average_loss,
+        class_names=class_names,
+    )
 
 
 def train_epoch(
@@ -374,6 +572,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         binary_task=config.binary_task,
     )
     num_classes = len(class_names)
+    selection_metric = resolve_selection_metric(config.selection_metric, num_classes)
     print(f"Found {len(samples)} samples")
 
     # 打印类别分布
@@ -576,6 +775,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     )
     print(f"训练集类别计数: {label_summary}")
     print(f"不平衡策略: sampler={config.sampling_strategy}, class_weight={config.class_weight_strategy}")
+    print(f"最佳模型选择指标: {selection_metric}")
+    from lung_cancer_cls.model import build_model
     model = build_model(
         config.model,
         num_classes=num_classes,
@@ -616,7 +817,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 7. 训练循环
-    best_val_acc = -1.0
+    best_val_score = -float("inf")
+    best_epoch = 0
+    best_val_metrics: Dict[str, Any] | None = None
     history = []
 
     print(f"\n开始训练（共 {config.epochs} 轮）")
@@ -633,61 +836,83 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             scheduler_step_per_batch=scheduler_step_per_batch,
             use_mask_guided_input=config.use_mask_guided_input,
         )
-        val_loss, val_acc = evaluate(
+        val_metrics = evaluate(
             model,
             val_loader,
             device,
             criterion,
+            class_names=class_names,
             use_mask_guided_input=config.use_mask_guided_input,
         )
+        selection_score, used_metric = resolve_selection_score(val_metrics, selection_metric)
 
         if scheduler is not None and not scheduler_step_per_batch:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_acc)
+                scheduler.step(selection_score)
             else:
                 scheduler.step()
 
-        history.append({
+        epoch_log = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val_loss": val_loss,
-            "val_acc": val_acc
-        })
+            "selection_metric": selection_metric,
+            "selection_metric_used": used_metric,
+            "selection_score": _safe_float(selection_score),
+        }
+        epoch_log.update({f"val_{k}": v for k, v in build_epoch_log(val_metrics).items()})
+        history.append(epoch_log)
 
         print(f"[Epoch {epoch}/{config.epochs}] "
               f"train_loss={train_loss:.4f} "
-              f"val_loss={val_loss:.4f} "
-              f"val_acc={val_acc:.4f} "
+              f"val_loss={_format_metric(_safe_float(val_metrics.get('loss')))} "
+              f"val_acc={_format_metric(_safe_float(val_metrics.get('accuracy')))} "
+              f"val_auc={_format_metric(_safe_float(val_metrics.get('auroc')))} "
+              f"val_bacc={_format_metric(_safe_float(val_metrics.get('balanced_accuracy')))} "
+              f"val_f1={_format_metric(_safe_float(val_metrics.get('f1')))} "
+              f"monitor({used_metric})={_format_metric(_safe_float(val_metrics.get(used_metric)))} "
               f"lr={optimizer.param_groups[0]['lr']:.6f}")
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if selection_score > best_val_score:
+            best_val_score = selection_score
+            best_epoch = epoch
+            best_val_metrics = val_metrics
             torch.save(model.state_dict(), out_dir / "best_model.pt")
             print(f"  保存最佳模型 (epoch {epoch})")
 
     # 8. 评估测试集
     test_loss: float | None = None
     test_acc: float | None = None
+    test_metrics: Dict[str, Any] | None = None
     if test_loader is not None:
         print("\n" + "-" * 60)
         print("在测试集上评估最佳模型...")
         model.load_state_dict(torch.load(out_dir / "best_model.pt"))
-        test_loss, test_acc = evaluate(
+        test_metrics = evaluate(
             model,
             test_loader,
             device,
             criterion,
+            class_names=class_names,
             use_mask_guided_input=config.use_mask_guided_input,
         )
+        test_loss = _safe_float(test_metrics.get("loss"))
+        test_acc = _safe_float(test_metrics.get("accuracy"))
         print(f"测试结果: loss={test_loss:.4f}, acc={test_acc:.4f}")
     else:
         print("\n" + "-" * 60)
         print("跳过测试集评估（split_mode=train_val）")
 
     # 9. 保存指标
+    best_val_acc = _safe_float(best_val_metrics.get("accuracy")) if best_val_metrics else None
+    best_val_auroc = _safe_float(best_val_metrics.get("auroc")) if best_val_metrics else None
     metrics = {
         "dataset_type": config.dataset_type.name,
+        "best_epoch": best_epoch,
+        "selection_metric": selection_metric,
+        "best_val_metrics": best_val_metrics,
         "best_val_acc": best_val_acc,
+        "best_val_auroc": best_val_auroc,
+        "test_metrics": test_metrics,
         "test_acc": test_acc,
         "test_loss": test_loss,
         "history": history,
@@ -700,6 +925,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "pretrained": config.pretrained,
             "class_mode": config.class_mode,
             "binary_task": config.binary_task,
+            "selection_metric": config.selection_metric,
             "sampling_strategy": config.sampling_strategy,
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
@@ -918,8 +1144,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="分类任务模式：multiclass / binary"
     )
     parser.add_argument(
-        "--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal"], default="malignant_vs_rest",
+        "--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal"], default="malignant_vs_rest",
         help="二分类标签折叠方式"
+    )
+    parser.add_argument(
+        "--selection-metric", type=str, choices=sorted(SELECTION_METRICS), default="auto",
+        help="鏈€浣虫ā鍨嬮€夋嫨鎸囨爣锛歛uto 鍦?binary 鏃朵娇鐢?auroc锛屽湪 multiclass 鏃朵娇鐢?balanced_accuracy"
     )
     parser.add_argument(
         "--effective-num-beta", type=float, default=0.999,
@@ -932,9 +1162,8 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
+def train_main(args: argparse.Namespace) -> Dict[str, Any]:
     """主函数"""
-    args = build_parser().parse_args()
 
     # 将字符串转换为枚举
     dataset_str = args.dataset_type.lower().strip()
@@ -978,6 +1207,7 @@ def main():
         class_weight_strategy=args.class_weight_strategy,
         class_mode=args.class_mode,
         binary_task=args.binary_task,
+        selection_metric=args.selection_metric,
         effective_num_beta=args.effective_num_beta,
         use_3d_input=args.use_3d_input,
         depth_size=args.depth_size,
@@ -995,9 +1225,18 @@ def main():
         finetune_lr=args.finetune_lr,
     )
     if config.two_stage_bundle_to_csv:
-        train_bundle_then_finetune_csv(config)
-    else:
-        train_model(config)
+        return train_bundle_then_finetune_csv(config)
+    return train_model(config)
+
+
+def main():
+    """CLI entrypoint."""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+    args = build_parser().parse_args()
+    train_main(args)
 
 
 if __name__ == "__main__":

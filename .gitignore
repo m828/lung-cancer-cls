@@ -1,5 +1,7 @@
 # Output directories
 outputs/
+tmp_ct_cnv_smoke/
+tmp_export_table_smoke/
 
 # Python
 __pycache__/
@@ -37,3 +39,7 @@ ENV/
 
 # Jupyter Notebook
 .ipynb_checkpoints/
+
+# Local sensitive files
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDc36lT57
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDc36lT57.pub

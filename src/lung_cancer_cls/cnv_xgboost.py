@@ -411,6 +411,47 @@ def create_xgboost_estimator(
     return XGBClassifier(**params)
 
 
+def extract_estimator_diagnostics(
+    estimator: Any,
+    feature_names: Sequence[str],
+    top_k: int = 20,
+) -> Dict[str, Any]:
+    best_iteration = getattr(estimator, "best_iteration", None)
+    best_score = getattr(estimator, "best_score", None)
+
+    num_boosted_rounds: int | None = None
+    try:
+        num_boosted_rounds = int(estimator.get_booster().num_boosted_rounds())
+    except Exception:
+        num_boosted_rounds = None
+
+    top_features: List[Dict[str, Any]] = []
+    feature_importances = getattr(estimator, "feature_importances_", None)
+    if feature_importances is not None:
+        ranked = sorted(
+            zip(feature_names, np.asarray(feature_importances, dtype=np.float32).tolist()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        top_features = [
+            {"feature": name, "importance": float(score)}
+            for name, score in ranked[: max(1, int(top_k))]
+            if score > 0
+        ]
+
+    diagnostics = {
+        "best_iteration": int(best_iteration) if best_iteration is not None else -1,
+        "best_score": _safe_float(best_score),
+        "num_boosted_rounds": num_boosted_rounds,
+        "top_features": top_features,
+    }
+    if diagnostics["best_iteration"] >= 0 and diagnostics["num_boosted_rounds"] is not None:
+        diagnostics["used_boosting_rounds"] = int(diagnostics["best_iteration"] + 1)
+    else:
+        diagnostics["used_boosting_rounds"] = diagnostics["num_boosted_rounds"]
+    return diagnostics
+
+
 def _ensure_proba_shape(probabilities: np.ndarray) -> np.ndarray:
     probs = np.asarray(probabilities)
     if probs.ndim == 1:
@@ -511,6 +552,7 @@ def train_xgboost_baseline(config: CNVXGBoostConfig) -> Dict[str, Any]:
         fit_kwargs["verbose"] = False
 
     estimator.fit(X_train, y_train, **fit_kwargs)
+    diagnostics = extract_estimator_diagnostics(estimator, feature_names)
 
     train_metrics = evaluate_split(estimator, X_train, y_train, class_names)
     val_metrics = evaluate_split(estimator, X_val, y_val, class_names)
@@ -536,10 +578,13 @@ def train_xgboost_baseline(config: CNVXGBoostConfig) -> Dict[str, Any]:
         "config": _jsonable_config(config),
         "class_names": class_names,
         "feature_dim": int(len(feature_names)),
+        "gene_id_col": gene_id_col,
+        "gene_label_col": config.gene_label_col,
         "split_source": split_source,
         "selection_metric": selection_metric,
         "selection_metric_used": selection_metric_used,
         "selection_score": _safe_float(selection_score),
+        "estimator_diagnostics": diagnostics,
         "cohort_stats": {
             **cohort_stats,
             **dedup_stats,
@@ -561,7 +606,7 @@ def train_xgboost_baseline(config: CNVXGBoostConfig) -> Dict[str, Any]:
             "test": build_epoch_log(test_metrics),
         },
         "model_path": str(model_path),
-        "best_iteration": int(getattr(estimator, "best_iteration", -1) or -1),
+        "best_iteration": diagnostics["best_iteration"],
     }
 
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
@@ -573,6 +618,18 @@ def train_xgboost_baseline(config: CNVXGBoostConfig) -> Dict[str, Any]:
     print(f"Split source: {split_source}")
     print(f"Samples: total={len(cohort)} train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
     print(f"Selection metric: {selection_metric_used} = {_safe_float(selection_score)}")
+    print(
+        "Fit diagnostics: "
+        f"best_iteration={diagnostics['best_iteration']} "
+        f"used_rounds={diagnostics.get('used_boosting_rounds')} "
+        f"best_score={diagnostics.get('best_score')}"
+    )
+    if diagnostics["top_features"]:
+        top_feature_str = ", ".join(
+            f"{item['feature']}={item['importance']:.4f}"
+            for item in diagnostics["top_features"][:5]
+        )
+        print(f"Top features: {top_feature_str}")
     print(f"Validation AUROC: {val_metrics.get('auroc')}")
     if test_metrics.get("num_samples", 0):
         print(f"Test AUROC: {test_metrics.get('auroc')}")

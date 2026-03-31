@@ -439,3 +439,254 @@ python train.py \
 3. 固定公平对齐集合
 4. 再做 `CT + CNV` 教师网络
 5. 最后做 `CT student` 和 `KD` 对照
+
+## 13. 本轮交流后的最新判断
+
+结合目前已经跑出的结果与新增脚手架，当前更合理的推进方式是：
+
+- `CT only` 不再长时间为单模态 1 个点死扣
+- `CNV only` 仍值得再做一轮更规范的验证，因为当前 `AUROC≈0.89` 还不能直接判断是否已经到达该数据的正常水平
+- 当前主任务应转向 `CT + CNV` 教师网络，尽快验证基因信息是否真的给 `CT` 带来稳定增益
+- 只有在 `CT + CNV > CT only` 成立后，才值得继续推进 `KD`
+
+当前阶段最重要的问题不再是：
+
+- `CNV only` 能不能再多抠 1 个点
+
+而是：
+
+- `CNV` 对 `CT` 是否存在稳定、可复现的互补增益
+
+## 14. 本轮新增的实用工具
+
+本轮在仓库中又补了两类更实用的能力。
+
+### 14.1 CNV sweep 收口工具
+
+新增入口：
+
+- [train_cnv_xgboost_sweep.py](/c:/Users/a1823.MMY/Desktop/output/lung-cancer-cls/train_cnv_xgboost_sweep.py)
+
+核心实现：
+
+- [cnv_xgboost_sweep.py](/c:/Users/a1823.MMY/Desktop/output/lung-cancer-cls/src/lung_cancer_cls/cnv_xgboost_sweep.py)
+
+当前具备：
+
+- 支持多 `seed`
+- 支持轻量参数网格
+- 支持 `fast / formal` 两档推荐 preset
+- 自动输出 `leaderboard.csv / leaderboard.md / summary.json`
+
+### 14.2 结果表导出工具
+
+新增入口：
+
+- [export_experiment_table.py](/c:/Users/a1823.MMY/Desktop/output/lung-cancer-cls/export_experiment_table.py)
+
+核心实现：
+
+- [experiment_table.py](/c:/Users/a1823.MMY/Desktop/output/lung-cancer-cls/src/lung_cancer_cls/experiment_table.py)
+
+用途：
+
+- 将 `CT only / CNV only / CT + CNV` 的 `metrics.json` 统一整理成一份结果表
+- 自动输出 `csv + markdown`
+- 方便后续写教师网络消融表、阶段汇总表和论文实验表
+
+### 14.3 CT + CNV 教师网络说明文档
+
+新增说明：
+
+- [CT_CNV_MULTIMODAL_V1.md](/c:/Users/a1823.MMY/Desktop/output/lung-cancer-cls/CT_CNV_MULTIMODAL_V1.md)
+
+其中已补充：
+
+- `CT + CNV` v1 的结构说明
+- 当前最推荐的 teacher 消融组合
+- 结果表导出命令
+
+## 15. 当前更推荐的 CNV sweep 策略
+
+当前不建议一上来就做很宽的搜索。
+
+更推荐两阶段：
+
+### Step 1. 先跑 `fast`
+
+目的：
+
+- 检查 `gene tsv` 列结构
+- 检查 split 是否对齐
+- 检查 `best_iteration` 是否明显过小
+- 快速确认当前 `CNV only` 大致量级
+
+推荐命令：
+
+```bash
+python train_cnv_xgboost_sweep.py \
+  --metadata-csv <METADATA_CSV> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/cnv_xgboost_sweep_mvn_fast \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --use-predefined-split \
+  --preset fast
+```
+
+### Step 2. 再跑 `formal`
+
+目的：
+
+- 得到当前阶段更正式的 `CNV only` 收口结果
+- 观察多 seed 后的均值与波动
+- 为后续教师网络提供更可信的单模态对照
+
+推荐命令：
+
+```bash
+python train_cnv_xgboost_sweep.py \
+  --metadata-csv <METADATA_CSV> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/cnv_xgboost_sweep_mvn_formal \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --use-predefined-split \
+  --preset formal
+```
+
+当前重点看：
+
+- `leaderboard.csv`
+- `leaderboard.md`
+- `summary.json`
+- 每个 run 的 `best_iteration / used_boosting_rounds / top_features`
+
+## 16. 当前更推荐的 Teacher 消融方案
+
+当前阶段不建议一下子把 teacher 分成很多复杂版本。
+
+最实用的首批 teacher 组合是：
+
+1. `CT only` 参考线
+2. `CT + CNV` 主版本：`resnet3d18`
+3. `CT + CNV` 轻量对照：`attention3d_cnn`
+4. `CT + CNV` 2D 对照：`resnet3d18 + --disable-3d-input`
+
+推荐命名：
+
+- `outputs/ct_only_resnet3d18_mvn_formal`
+- `outputs/ct_cnv_resnet3d18_mvn_v1`
+- `outputs/ct_cnv_attention3d_mvn_v1`
+- `outputs/ct_cnv_resnet3d18_2d_mvn_v1`
+
+### 16.1 Teacher 主版本
+
+```bash
+python train_ct_cnv.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/ct_cnv_resnet3d18_mvn_v1 \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --aug-profile strong \
+  --optimizer adamw \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+### 16.2 Teacher 轻量对照
+
+```bash
+python train_ct_cnv.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/ct_cnv_attention3d_mvn_v1 \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --ct-model attention3d_cnn \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --aug-profile strong \
+  --optimizer adamw \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+### 16.3 Teacher 2D 对照
+
+```bash
+python train_ct_cnv.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/ct_cnv_resnet3d18_2d_mvn_v1 \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --ct-model resnet3d18 \
+  --disable-3d-input \
+  --image-size 224 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --aug-profile strong \
+  --optimizer adamw \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+## 17. 当前阶段更推荐的结果导出方式
+
+当你跑完第一批参考线与 teacher 消融后，建议不要手工抄表，直接导出统一结果表：
+
+```bash
+python export_experiment_table.py \
+  --run ct_only=outputs/ct_only_resnet3d18_mvn_formal \
+  --run cnv_formal=outputs/cnv_xgboost_sweep_mvn_formal/seed42_md3_mcw1_ss0.8_cs0.8_lr0.03_l21_gm0 \
+  --run teacher_main=outputs/ct_cnv_resnet3d18_mvn_v1 \
+  --run teacher_light=outputs/ct_cnv_attention3d_mvn_v1 \
+  --run teacher_2d=outputs/ct_cnv_resnet3d18_2d_mvn_v1 \
+  --output-dir outputs/stage_binary_summary
+```
+
+导出后会得到：
+
+- `experiment_table.csv`
+- `experiment_table.md`
+- `summary.json`
+
+更推荐的使用方式是：
+
+- `csv` 用于后续继续补列、作图和对比
+- `markdown` 用于直接粘进阶段记录、周报或实验备忘
+
+## 18. 当前阶段一句话更新版目标
+
+先把 `CNV only` 通过 `fast -> formal` 跑出可信区间，再用最小而清晰的一批 teacher 消融验证 `CT + CNV` 是否真实优于 `CT only`，最后才决定是否进入 `KD`。

@@ -132,6 +132,70 @@ python train_cnv_xgboost.py \
   --class-weight-strategy balanced
 ```
 
+### 5.3 轻量 sweep / 多 seed
+
+当你怀疑单次 `AUROC` 低于数据的正常水平时，优先做轻量重复实验，而不是直接上大规模搜索。
+
+新增入口：
+
+- `train_cnv_xgboost_sweep.py`
+- 默认支持两档 preset：
+  - `fast`
+  - `formal`
+
+推荐顺序：
+
+1. 先跑 `fast`，确认数据、split 和指标口径没有问题
+2. 再跑 `formal`，作为当前阶段更正式的 `CNV only` 收口结果
+
+示例：
+
+```bash
+python train_cnv_xgboost_sweep.py \
+  --metadata-csv <METADATA_CSV> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/cnv_xgboost_sweep_mvn \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --use-predefined-split \
+  --preset fast
+```
+
+```bash
+python train_cnv_xgboost_sweep.py \
+  --metadata-csv <METADATA_CSV> \
+  --gene-tsv <GENE_TSV> \
+  --output-dir outputs/cnv_xgboost_sweep_mvn_formal \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --use-predefined-split \
+  --preset formal
+```
+
+输出重点看：
+
+- `leaderboard.csv`
+- `leaderboard.md`
+- `summary.json`
+- 每个 run 下的 `metrics.json`
+
+`metrics.json` 里现在会额外记录：
+
+- `best_iteration`
+- `used_boosting_rounds`
+- `best_score`
+- `top_features`
+
+`summary.json` 里会记录：
+
+- 本次使用的 `preset`
+- 实际计划运行数
+- 最优 run 的关键指标
+
 ## 6. 当前建议
 
 `CNV only` 这一步不要先追复杂模型，先把下面这些做稳：

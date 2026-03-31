@@ -741,18 +741,24 @@ def get_default_transforms(
     profile = aug_profile.lower().strip()
 
     if profile == "strong":
-        train_tf = transforms.Compose([
+        strong_ops = [
             transforms.Resize((image_size + 16, image_size + 16)),
             transforms.RandomResizedCrop(image_size, scale=(0.75, 1.0), ratio=(0.9, 1.1)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.2),
             transforms.RandomAffine(degrees=12, translate=(0.06, 0.06), scale=(0.9, 1.1)),
             transforms.RandomApply([transforms.GaussianBlur(kernel_size=3)], p=0.25),
-            transforms.RandomAdjustSharpness(sharpness_factor=1.8, p=0.2),
-            transforms.ToTensor(),
-            transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0),
-            transforms.Normalize(mean=[0.5], std=[0.5]),
-        ])
+        ]
+        if hasattr(transforms, "RandomAdjustSharpness"):
+            strong_ops.append(transforms.RandomAdjustSharpness(sharpness_factor=1.8, p=0.2))
+        strong_ops.extend(
+            [
+                transforms.ToTensor(),
+                transforms.RandomErasing(p=0.2, scale=(0.02, 0.15), ratio=(0.3, 3.3), value=0.0),
+                transforms.Normalize(mean=[0.5], std=[0.5]),
+            ]
+        )
+        train_tf = transforms.Compose(strong_ops)
         val_test_tf = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),

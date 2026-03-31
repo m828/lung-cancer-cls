@@ -6,7 +6,10 @@ import torch
 from torch import nn
 from torchvision import models
 
-import monai
+try:
+    import monai
+except ImportError:  # pragma: no cover - optional dependency
+    monai = None
 
 
 class SEModule(nn.Module):
@@ -412,6 +415,11 @@ class DenseNet3D_121(nn.Module):
     """Monai DenseNet121 3D用于CT体数据分类"""
     def __init__(self, num_classes: int = 3):
         super().__init__()
+        if monai is None:
+            raise RuntimeError(
+                "MONAI is required for densenet3d_121. Install it with `pip install monai` "
+                "or switch to another CT backbone."
+            )
         self.backbone = monai.networks.nets.DenseNet121(
             spatial_dims=3, n_input_channels=1, out_channels=num_classes
         )

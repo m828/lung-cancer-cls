@@ -8,6 +8,20 @@ from typing import Any, Dict, List, Sequence, Tuple
 import pandas as pd
 
 
+def _normalize_modalities(value: Any) -> Tuple[str, ...]:
+    if value is None:
+        return tuple()
+    if isinstance(value, str):
+        parts = [item.strip().lower() for item in value.split(",") if item.strip()]
+    else:
+        parts = [str(item).strip().lower() for item in value if str(item).strip()]
+    deduped: List[str] = []
+    for part in parts:
+        if part not in deduped:
+            deduped.append(part)
+    return tuple(deduped)
+
+
 def _safe_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -27,8 +41,29 @@ def _get_metric(metrics: Dict[str, Any] | None, key: str) -> float | None:
 
 
 def _detect_family(metrics: Dict[str, Any]) -> str:
+    explicit_family = str(metrics.get("family") or "").strip()
+    if explicit_family and explicit_family != "unknown":
+        return explicit_family
+
     config = metrics.get("config", {})
+    modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
     if isinstance(config, dict):
+        if metrics.get("teacher_run_dir") or config.get("teacher_run_dir"):
+            return "student_kd"
+        if modalities == ("text",):
+            return "text_only"
+        if modalities == ("ct",):
+            return "ct_only"
+        if modalities == ("cnv",):
+            return "cnv_only"
+        if len(modalities) == 2 and set(modalities) == {"ct", "cnv"}:
+            return "ct_cnv"
+        if len(modalities) == 2 and set(modalities) == {"ct", "text"}:
+            return "ct_text"
+        if len(modalities) == 3 and set(modalities) == {"ct", "cnv", "text"}:
+            return "ct_cnv_text"
+        if modalities:
+            return "multimodal"
         if "ct_model" in config or "gene_hidden_dim" in config:
             return "ct_cnv"
         if "n_estimators" in config or "model_path" in metrics or "estimator_diagnostics" in metrics:
@@ -40,6 +75,11 @@ def _detect_family(metrics: Dict[str, Any]) -> str:
 
 def _resolve_backbone(family: str, metrics: Dict[str, Any]) -> str:
     config = metrics.get("config", {})
+    modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
+    if family in {"student_kd", "ct_cnv", "ct_text", "ct_cnv_text", "multimodal", "ct_only"} and "ct" in modalities:
+        return str(config.get("ct_model") or config.get("model") or "unknown")
+    if family == "text_only":
+        return "text_clinical"
     if family == "ct_cnv":
         return str(config.get("ct_model", "unknown"))
     if family == "ct_only":
@@ -51,14 +91,21 @@ def _resolve_backbone(family: str, metrics: Dict[str, Any]) -> str:
 
 def _resolve_input_mode(family: str, metrics: Dict[str, Any]) -> str:
     config = metrics.get("config", {})
+    modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
     if family == "cnv_only":
         return "tabular"
+    if family == "text_only":
+        return "tabular+text"
+    if "ct" not in modalities and modalities:
+        return "+".join(modalities)
     use_3d = bool(config.get("use_3d_input"))
     if family == "ct_only" and not use_3d:
         model_name = str(config.get("model", "")).lower()
         if any(token in model_name for token in ["3d", "mc3", "r2plus1d", "swin3d", "attention3d"]):
             use_3d = True
-    return "3d" if use_3d else "2d"
+    ct_mode = "3d" if use_3d else "2d"
+    extras = [mod for mod in modalities if mod != "ct"]
+    return ct_mode if not extras else f"{ct_mode}+{'+'.join(extras)}"
 
 
 def _collect_paths(run_specs: Sequence[str], run_dirs: Sequence[str], metrics_name: str) -> List[Tuple[str, Path]]:
@@ -93,10 +140,13 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
 
     family = _detect_family(metrics)
     config = metrics.get("config", {})
+    modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
+    teacher_modalities = _normalize_modalities(metrics.get("teacher_modalities"))
     val_metrics = metrics.get("val_metrics") or metrics.get("best_val_metrics") or {}
     test_metrics = metrics.get("test_metrics") or {}
     train_metrics = metrics.get("train_metrics") or {}
     cohort_stats = metrics.get("cohort_stats", {})
+    modality_feature_dims = metrics.get("modality_feature_dims") or {}
     num_total = cohort_stats.get("num_total")
     if num_total is None and "rows_after_dedup" in cohort_stats:
         num_total = cohort_stats.get("rows_after_dedup")
@@ -104,6 +154,8 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
     row = {
         "experiment": label,
         "family": family,
+        "modalities": ",".join(modalities),
+        "teacher_modalities": ",".join(teacher_modalities),
         "backbone": _resolve_backbone(family, metrics),
         "input_mode": _resolve_input_mode(family, metrics),
         "selection_metric": metrics.get("selection_metric") or metrics.get("selection_metric_used"),
@@ -115,7 +167,10 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
         "num_val": cohort_stats.get("num_val"),
         "num_test": cohort_stats.get("num_test"),
         "best_epoch": metrics.get("best_epoch"),
-        "feature_dim": metrics.get("feature_dim"),
+        "feature_dim": metrics.get("feature_dim") or sum(
+            int(modality_feature_dims.get(key, 0) or 0)
+            for key in ["ct", "text", "cnv"]
+        ),
         "val_auroc": _get_metric(val_metrics, "auroc"),
         "val_auprc": _get_metric(val_metrics, "auprc"),
         "val_bacc": _get_metric(val_metrics, "balanced_accuracy"),
@@ -129,6 +184,7 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
         "test_sensitivity": _get_metric(test_metrics, "sensitivity"),
         "test_specificity": _get_metric(test_metrics, "specificity"),
         "train_auroc": _get_metric(train_metrics, "auroc"),
+        "teacher_run_dir": metrics.get("teacher_run_dir"),
         "run_dir": str(metrics_path.parent),
     }
     if family == "cnv_only":
@@ -142,6 +198,7 @@ def _write_markdown(path: Path, table: pd.DataFrame) -> None:
     columns = [
         "experiment",
         "family",
+        "modalities",
         "backbone",
         "input_mode",
         "test_auroc",

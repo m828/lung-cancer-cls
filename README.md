@@ -5,6 +5,7 @@
 - [二分类阶段记录与后续计划](./BINARY_CT_STAGE_NOTES.md)
 - [CNV Only XGBoost 基线说明](./CNV_XGBOOST_BASELINE.md)
 - [CT + CNV 多模态 V1 说明](./CT_CNV_MULTIMODAL_V1.md)
+- [文本模态、多模态教师网络与蒸馏说明](./TEXT_MULTIMODAL_KD_STAGE.md)
 
 一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD、LUNA16、LIDC-IDRI 和内网 CT（`intranet_ct`）四个数据来源，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
 

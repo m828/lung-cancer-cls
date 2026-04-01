@@ -2,6 +2,8 @@
 outputs/
 tmp_ct_cnv_smoke/
 tmp_export_table_smoke/
+tmp_text_doc_smoke/
+tmp_text_teacher_student_smoke/
 
 # Python
 __pycache__/

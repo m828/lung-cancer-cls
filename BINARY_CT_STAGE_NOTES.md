@@ -690,3 +690,234 @@ python export_experiment_table.py \
 ## 18. 当前阶段一句话更新版目标
 
 先把 `CNV only` 通过 `fast -> formal` 跑出可信区间，再用最小而清晰的一批 teacher 消融验证 `CT + CNV` 是否真实优于 `CT only`，最后才决定是否进入 `KD`。
+
+## 19. 本轮新增：文本模态正式并入主线
+
+这一轮已经把之前单独的 `test_all3.py` 思路整合进项目主线。
+
+当前的文本模态不是“纯自由文本分类”，而是：
+
+- 结构化临床数值特征
+- 多列病历文本拼接后的 `BERT CLS embedding`
+- 数值分支和文本分支的注意力融合
+
+项目中的对应实现：
+
+- `prepare_text_features.py`
+- `train_multimodal.py`
+- `train_student_kd.py`
+- `TEXT_MULTIMODAL_KD_STAGE.md`
+
+这里建议把该模态统一叫做：
+
+- `TextClinical`
+
+## 20. 当前最推荐的脚本选择
+
+如果只是为了延续之前的 `CT + CNV` 参考线，旧脚本仍然可用：
+
+- `train_ct_cnv.py`
+
+但如果当前目标是：
+
+- 文本单模态
+- `CT + Text`
+- `CT + CNV + Text`
+- teacher / student / KD
+
+更推荐统一使用：
+
+- `train_multimodal.py`
+- `train_student_kd.py`
+
+原因很直接：
+
+- 所有模态组合走同一套对齐逻辑
+- 保存格式统一
+- 自动输出 `split_manifest.csv`
+- teacher 和 student 可以精确复用同一划分
+- 结果表可以直接统一导出
+
+## 21. 当前更推荐的文本与蒸馏实验顺序
+
+不建议先把文本单模态或者 `CNV only` 继续长时间抠到极致。
+
+当前更实用的顺序是：
+
+1. `Text only`
+2. `CT + CNV`
+3. `CT + Text`
+4. `CT + CNV + Text teacher`
+5. `CT student + KD`
+6. `CT + Text student + KD`
+
+当前最关键的问题不是：
+
+- 单模态还能不能再提 1 个点
+
+而是：
+
+- 文本能不能补 CT
+- `CT + CNV + Text` 是否真实优于 `CT only`
+- 学生网络能不能继承多模态 teacher 的能力
+
+## 22. 本轮交流后的推荐命令
+
+### 22.1 文本特征准备
+
+```bash
+python prepare_text_features.py \
+  --output-tsv outputs/text_features_v1.tsv \
+  --text-health-csv <TEXT_HEALTH_CSV> \
+  --text-disease-csv <TEXT_DISEASE_CSV> \
+  --bert-model-path <LOCAL_BERT_DIR> \
+  --embedding-backend bert \
+  --batch-size 8 \
+  --max-length 128
+```
+
+### 22.2 Text only
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --output-dir outputs/text_only_v1 \
+  --modalities text \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --epochs 30 \
+  --batch-size 16 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+### 22.3 CT + Text
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --output-dir outputs/ct_text_v1 \
+  --modalities ct,text \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+### 22.4 CT + CNV + Text Teacher
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --gene-tsv <GENE_TSV> \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --output-dir outputs/ct_cnv_text_teacher_v1 \
+  --modalities ct,cnv,text \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --use-predefined-split
+```
+
+### 22.5 CT Student + KD
+
+```bash
+python train_student_kd.py \
+  --output-dir outputs/ct_student_kd_v1 \
+  --modalities ct \
+  --teacher-run-dir outputs/ct_cnv_text_teacher_v1 \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --distillation-alpha 0.5 \
+  --distillation-temperature 4.0
+```
+
+### 22.6 CT + Text Student + KD
+
+```bash
+python train_student_kd.py \
+  --output-dir outputs/ct_text_student_kd_v1 \
+  --modalities ct,text \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --teacher-run-dir outputs/ct_cnv_text_teacher_v1 \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --distillation-alpha 0.5 \
+  --distillation-temperature 4.0
+```
+
+### 22.7 统一结果表导出
+
+```bash
+python export_experiment_table.py \
+  --run text_only=outputs/text_only_v1 \
+  --run ct_cnv=outputs/ct_cnv_mm_v1 \
+  --run ct_text=outputs/ct_text_v1 \
+  --run teacher=outputs/ct_cnv_text_teacher_v1 \
+  --run student_ct=outputs/ct_student_kd_v1 \
+  --run student_ct_text=outputs/ct_text_student_kd_v1 \
+  --output-dir outputs/text_teacher_student_summary
+```
+
+## 23. 这轮实现后的阶段判断
+
+现在的主线已经从：
+
+- `CT only -> CNV only -> CT + CNV`
+
+扩展成：
+
+- `Text only`
+- `CT + CNV`
+- `CT + Text`
+- `CT + CNV + Text teacher`
+- `CT / CT + Text student + KD`
+
+因此下一步不再是“要不要做文本”，而是：
+
+- 先用真实数据验证文本是否提供稳定增益
+- 再看 full teacher 是否真实优于 `CT only`
+- 只有 teacher 稳定成立，student + KD 才值得继续深入

@@ -18,6 +18,8 @@ def _write_json(path: Path, data):
 def test_export_experiment_table_smoke(tmp_path: Path):
     ct_dir = tmp_path / "ct_only_run"
     mm_dir = tmp_path / "ct_cnv_run"
+    text_dir = tmp_path / "text_only_run"
+    student_dir = tmp_path / "student_kd_run"
 
     _write_json(
         ct_dir / "metrics.json",
@@ -34,23 +36,56 @@ def test_export_experiment_table_smoke(tmp_path: Path):
     _write_json(
         mm_dir / "metrics.json",
         {
+            "family": "ct_cnv_text",
             "best_epoch": 5,
             "selection_metric": "auroc",
             "split_source": "predefined",
-            "feature_dim": 128,
+            "modality_feature_dims": {"ct": 128, "text": 256, "cnv": 128},
             "cohort_stats": {"num_total": 100, "num_train": 70, "num_val": 15, "num_test": 15},
             "best_val_metrics": {"auroc": 0.94, "balanced_accuracy": 0.86, "f1": 0.88, "sensitivity": 0.89, "specificity": 0.83},
             "test_metrics": {"auroc": 0.93, "balanced_accuracy": 0.84, "f1": 0.87, "sensitivity": 0.88, "specificity": 0.82},
-            "config": {"ct_model": "resnet3d18", "class_mode": "binary", "binary_task": "malignant_vs_normal", "use_3d_input": True, "gene_hidden_dim": 256},
+            "modalities": ["ct", "cnv", "text"],
+            "config": {"ct_model": "resnet3d18", "class_mode": "binary", "binary_task": "malignant_vs_normal", "use_3d_input": True, "gene_hidden_dim": 256, "modalities": ["ct", "cnv", "text"]},
+        },
+    )
+    _write_json(
+        text_dir / "metrics.json",
+        {
+            "family": "text_only",
+            "best_epoch": 4,
+            "selection_metric": "auroc",
+            "cohort_stats": {"num_total": 80, "num_train": 56, "num_val": 12, "num_test": 12},
+            "best_val_metrics": {"auroc": 0.88, "balanced_accuracy": 0.78, "f1": 0.79},
+            "test_metrics": {"auroc": 0.86, "balanced_accuracy": 0.77, "f1": 0.76},
+            "modalities": ["text"],
+            "modality_feature_dims": {"text": 256},
+            "config": {"modalities": ["text"], "class_mode": "binary", "binary_task": "malignant_vs_normal"},
+        },
+    )
+    _write_json(
+        student_dir / "metrics.json",
+        {
+            "family": "student_kd",
+            "best_epoch": 6,
+            "selection_metric": "auroc",
+            "cohort_stats": {"num_total": 100, "num_train": 70, "num_val": 15, "num_test": 15},
+            "best_val_metrics": {"auroc": 0.92, "balanced_accuracy": 0.84, "f1": 0.86},
+            "test_metrics": {"auroc": 0.91, "balanced_accuracy": 0.83, "f1": 0.85},
+            "modalities": ["ct"],
+            "teacher_modalities": ["ct", "cnv", "text"],
+            "teacher_run_dir": str(mm_dir),
+            "modality_feature_dims": {"ct": 128},
+            "config": {"ct_model": "resnet3d18", "modalities": ["ct"], "class_mode": "binary", "binary_task": "malignant_vs_normal", "use_3d_input": True},
         },
     )
 
     summary = export_experiment_table(
-        run_specs=[f"ct_only={ct_dir}", f"teacher={mm_dir}"],
+        run_specs=[f"ct_only={ct_dir}", f"teacher={mm_dir}", f"text_only={text_dir}", f"student={student_dir}"],
         run_dirs=[],
         output_dir=tmp_path / "table_out",
     )
 
-    assert summary["num_runs"] == 2
+    assert summary["num_runs"] == 4
+    assert set(summary["families"]) >= {"ct_cnv_text", "student_kd", "text_only"}
     assert (tmp_path / "table_out" / "experiment_table.csv").exists()
     assert (tmp_path / "table_out" / "experiment_table.md").exists()

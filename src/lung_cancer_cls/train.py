@@ -19,6 +19,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -335,12 +336,18 @@ def build_epoch_log(metrics: Dict[str, Any]) -> Dict[str, float | None]:
         "balanced_accuracy",
         "auroc",
         "auprc",
+        "mcc",
         "f1",
         "precision",
         "recall",
         "sensitivity",
         "specificity",
+        "npv",
+        "fpr",
+        "fnr",
+        "youden_j",
         "brier_score",
+        "ece",
     ]
     return {key: _safe_float(metrics.get(key)) for key in keys if key in metrics}
 
@@ -360,6 +367,7 @@ def compute_classification_metrics(
         "accuracy": _safe_float(accuracy_score(y_true, predictions)),
         "balanced_accuracy": _metric_with_fallback(balanced_accuracy_score, y_true, predictions),
         "confusion_matrix": confusion_matrix(y_true, predictions, labels=labels).tolist(),
+        "mcc": _metric_with_fallback(matthews_corrcoef, y_true, predictions),
         "num_samples": int(y_true.shape[0]),
     }
 
@@ -372,17 +380,58 @@ def compute_classification_metrics(
         specificity = None
         if (tn + fp) > 0:
             specificity = float(tn / (tn + fp))
+        npv = None
+        if (tn + fn) > 0:
+            npv = float(tn / (tn + fn))
+        fpr = None if (fp + tn) == 0 else float(fp / (fp + tn))
+        fnr = None if (fn + tp) == 0 else float(fn / (fn + tp))
+        prevalence = float(np.mean(y_true.astype(np.float32)))
+        predicted_positive_rate = float(np.mean(predictions.astype(np.float32)))
+        youden_j = None
+        if specificity is not None:
+            youden_j = float(recall + specificity - 1.0)
+        mcc = None
+        mcc_denom = float((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+        if mcc_denom > 0:
+            mcc = float((tp * tn - fp * fn) / np.sqrt(mcc_denom))
+
+        # Expected calibration error with equal-width bins.
+        num_bins = 10
+        ece = 0.0
+        bin_edges = np.linspace(0.0, 1.0, num_bins + 1)
+        for bin_idx in range(num_bins):
+            lower = bin_edges[bin_idx]
+            upper = bin_edges[bin_idx + 1]
+            if bin_idx == num_bins - 1:
+                mask = (positive_probs >= lower) & (positive_probs <= upper)
+            else:
+                mask = (positive_probs >= lower) & (positive_probs < upper)
+            if not np.any(mask):
+                continue
+            bin_conf = float(np.mean(positive_probs[mask]))
+            bin_acc = float(np.mean(y_true[mask].astype(np.float32)))
+            ece += abs(bin_acc - bin_conf) * (float(np.sum(mask)) / float(len(y_true)))
 
         metrics.update(
             {
                 "auroc": _metric_with_fallback(roc_auc_score, y_true, positive_probs),
                 "auprc": _metric_with_fallback(average_precision_score, y_true, positive_probs),
+                "mcc": mcc,
                 "precision": _safe_float(precision),
+                "ppv": _safe_float(precision),
+                "precision_positive": _safe_float(precision),
                 "recall": _safe_float(recall),
                 "sensitivity": _safe_float(recall),
                 "specificity": specificity,
+                "npv": npv,
+                "fpr": fpr,
+                "fnr": fnr,
+                "youden_j": youden_j,
+                "prevalence": prevalence,
+                "predicted_positive_rate": predicted_positive_rate,
                 "f1": _safe_float(f1),
                 "brier_score": float(np.mean((positive_probs - y_true.astype(np.float32)) ** 2)),
+                "ece": float(ece),
                 "positive_class": class_names.get(1, "class_1"),
                 "negative_class": class_names.get(0, "class_0"),
             }
@@ -407,10 +456,17 @@ def compute_classification_metrics(
                 "precision_macro": _safe_float(
                     precision_score(y_true, predictions, average="macro", zero_division=0)
                 ),
+                "precision_weighted": _safe_float(
+                    precision_score(y_true, predictions, average="weighted", zero_division=0)
+                ),
                 "recall_macro": _safe_float(
                     recall_score(y_true, predictions, average="macro", zero_division=0)
                 ),
+                "recall_weighted": _safe_float(
+                    recall_score(y_true, predictions, average="weighted", zero_division=0)
+                ),
                 "f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
+                "f1_weighted": _safe_float(f1_score(y_true, predictions, average="weighted", zero_division=0)),
             }
         )
 
@@ -458,12 +514,18 @@ def evaluate(
             "balanced_accuracy": None,
             "auroc": None,
             "auprc": None,
+            "mcc": None,
             "f1": None,
             "precision": None,
             "recall": None,
             "sensitivity": None,
             "specificity": None,
+            "npv": None,
+            "fpr": None,
+            "fnr": None,
+            "youden_j": None,
             "brier_score": None,
+            "ece": None,
             "confusion_matrix": [],
             "num_samples": 0,
         }

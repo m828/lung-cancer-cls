@@ -20,6 +20,7 @@ def test_export_experiment_table_smoke(tmp_path: Path):
     mm_dir = tmp_path / "ct_cnv_run"
     text_dir = tmp_path / "text_only_run"
     student_dir = tmp_path / "student_kd_run"
+    external_dir = tmp_path / "bundle_eval_run"
 
     _write_json(
         ct_dir / "metrics.json",
@@ -78,14 +79,25 @@ def test_export_experiment_table_smoke(tmp_path: Path):
             "config": {"ct_model": "resnet3d18", "modalities": ["ct"], "class_mode": "binary", "binary_task": "malignant_vs_normal", "use_3d_input": True},
         },
     )
+    _write_json(
+        external_dir / "external_bundle_metrics.json",
+        {
+            "source_run_dir": str(student_dir),
+            "source_family": "student_kd",
+            "external_dataset": "intranet_bundle",
+            "num_samples": 120,
+            "metrics": {"auroc": 0.89, "balanced_accuracy": 0.81, "f1": 0.83, "sensitivity": 0.82, "specificity": 0.80},
+            "config": {"run_dir": str(student_dir)},
+        },
+    )
 
     summary = export_experiment_table(
-        run_specs=[f"ct_only={ct_dir}", f"teacher={mm_dir}", f"text_only={text_dir}", f"student={student_dir}"],
+        run_specs=[f"ct_only={ct_dir}", f"teacher={mm_dir}", f"text_only={text_dir}", f"student={student_dir}", f"student_bundle={external_dir / 'external_bundle_metrics.json'}"],
         run_dirs=[],
         output_dir=tmp_path / "table_out",
     )
 
-    assert summary["num_runs"] == 4
-    assert set(summary["families"]) >= {"ct_cnv_text", "student_kd", "text_only"}
+    assert summary["num_runs"] == 5
+    assert set(summary["families"]) >= {"ct_cnv_text", "student_kd", "text_only", "student_kd_external"}
     assert (tmp_path / "table_out" / "experiment_table.csv").exists()
     assert (tmp_path / "table_out" / "experiment_table.md").exists()

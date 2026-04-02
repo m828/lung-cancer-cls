@@ -44,6 +44,8 @@ def _detect_family(metrics: Dict[str, Any]) -> str:
     explicit_family = str(metrics.get("family") or "").strip()
     if explicit_family and explicit_family != "unknown":
         return explicit_family
+    if metrics.get("external_dataset") and metrics.get("source_family"):
+        return f"{metrics.get('source_family')}_external"
 
     config = metrics.get("config", {})
     modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
@@ -142,10 +144,16 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
     config = metrics.get("config", {})
     modalities = _normalize_modalities(metrics.get("modalities") or config.get("modalities"))
     teacher_modalities = _normalize_modalities(metrics.get("teacher_modalities"))
-    val_metrics = metrics.get("val_metrics") or metrics.get("best_val_metrics") or {}
-    test_metrics = metrics.get("test_metrics") or {}
-    train_metrics = metrics.get("train_metrics") or {}
-    cohort_stats = metrics.get("cohort_stats", {})
+    if metrics.get("external_dataset") and metrics.get("metrics"):
+        val_metrics = {}
+        test_metrics = metrics.get("metrics") or {}
+        train_metrics = {}
+        cohort_stats = {"num_total": metrics.get("num_samples")}
+    else:
+        val_metrics = metrics.get("val_metrics") or metrics.get("best_val_metrics") or {}
+        test_metrics = metrics.get("test_metrics") or {}
+        train_metrics = metrics.get("train_metrics") or {}
+        cohort_stats = metrics.get("cohort_stats", {})
     modality_feature_dims = metrics.get("modality_feature_dims") or {}
     num_total = cohort_stats.get("num_total")
     if num_total is None and "rows_after_dedup" in cohort_stats:
@@ -185,6 +193,7 @@ def _load_row(label: str, metrics_path: Path) -> Dict[str, Any]:
         "test_specificity": _get_metric(test_metrics, "specificity"),
         "train_auroc": _get_metric(train_metrics, "auroc"),
         "teacher_run_dir": metrics.get("teacher_run_dir"),
+        "external_dataset": metrics.get("external_dataset"),
         "run_dir": str(metrics_path.parent),
     }
     if family == "cnv_only":
@@ -198,6 +207,7 @@ def _write_markdown(path: Path, table: pd.DataFrame) -> None:
     columns = [
         "experiment",
         "family",
+        "external_dataset",
         "modalities",
         "backbone",
         "input_mode",

@@ -68,6 +68,33 @@ def _write_tiny_multimodal_fixture(tmp_path: Path) -> tuple[Path, Path, Path, Pa
             }
         )
 
+    for offset, label_name in enumerate(["健康对照", "肺癌"], start=len(split_plan)):
+        sample_id = f"S{offset}"
+        record_id = f"R{offset}"
+        rel_path = f"{sample_id}.npy"
+        ct_array = np.random.randn(6, 12, 12).astype("float32") + (1.0 if label_name == "肺癌" else 0.0)
+        np.save(ct_root / rel_path, ct_array)
+        meta_rows.append(
+            {
+                "SampleID": sample_id,
+                "record_id": record_id,
+                "样本类型": label_name,
+                "CT_numpy_cloud路径": rel_path,
+                "CT_train_val_split": "train" if label_name == "健康对照" else "val",
+            }
+        )
+        text_rows.append(
+            {
+                "record_id": record_id,
+                "num__age": 60 + offset,
+                "num__marker": 1.0 if label_name == "肺癌" else 0.0,
+                "bert_0000": 0.1 * offset,
+                "bert_0001": 1.0 if label_name == "肺癌" else -1.0,
+                "bert_0002": -0.2 * offset,
+                "bert_0003": 0.3 * (offset % 3),
+            }
+        )
+
     pd.DataFrame(meta_rows).to_csv(meta_csv, index=False)
     pd.DataFrame(gene_rows).to_csv(gene_tsv, sep="\t", index=False)
     pd.DataFrame(text_rows).to_csv(text_tsv, sep="\t", index=False)
@@ -99,6 +126,7 @@ def test_multimodal_teacher_student_smoke(tmp_path: Path):
         )
     )
     assert text_metrics["family"] == "text_only"
+    assert text_metrics["cohort_stats"]["num_total"] == 10
     assert (tmp_path / "text_only" / "best_model.pt").exists()
 
     teacher_metrics = train_multimodal_model(
@@ -126,8 +154,36 @@ def test_multimodal_teacher_student_smoke(tmp_path: Path):
         )
     )
     assert teacher_metrics["family"] == "ct_cnv_text"
+    assert teacher_metrics["cohort_stats"]["num_total"] == 8
     assert (tmp_path / "teacher" / "best_model.pt").exists()
     assert (tmp_path / "teacher" / "split_manifest.csv").exists()
+
+    ct_text_metrics = train_multimodal_model(
+        MultiModalTrainConfig(
+            data_root=tmp_path,
+            metadata_csv=meta_csv,
+            output_dir=tmp_path / "ct_text_aligned",
+            modalities=("ct", "text"),
+            ct_root=ct_root,
+            text_feature_tsv=text_tsv,
+            reference_manifest=tmp_path / "teacher" / "split_manifest.csv",
+            use_predefined_split=True,
+            epochs=1,
+            batch_size=2,
+            num_workers=0,
+            cpu=True,
+            ct_model="attention3d_cnn",
+            depth_size=8,
+            volume_hw=32,
+            ct_feature_dim=16,
+            text_feature_dim=8,
+            fusion_hidden_dim=8,
+            save_predictions=False,
+        )
+    )
+    assert ct_text_metrics["family"] == "ct_text"
+    assert ct_text_metrics["split_source"] == "reference_manifest"
+    assert ct_text_metrics["cohort_stats"]["num_total"] == 8
 
     student_metrics = train_student_kd(
         StudentKDConfig(

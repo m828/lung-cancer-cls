@@ -921,3 +921,328 @@ python export_experiment_table.py \
 - 先用真实数据验证文本是否提供稳定增益
 - 再看 full teacher 是否真实优于 `CT only`
 - 只有 teacher 稳定成立，student + KD 才值得继续深入
+
+## 24. 当前更严格的评估协议
+
+在最新一轮结果分析后，当前更推荐的实验协议要比之前再收紧一层。
+
+核心原则：
+
+- `train_val` 可以用于快速摸底
+- 正式结论必须回到 `train_val_test`
+- 所有横向对比要尽量使用同一 cohort、同一 split
+- `teacher / student / baseline` 之间必须是 apples-to-apples 对比
+
+### 24.1 为什么正式结果必须回到 `train_val_test`
+
+`train_val` 的优点是：
+
+- 训练样本更多
+- 适合快速筛 backbone、学习率、模态组合
+
+但它的问题也很明确：
+
+- 没有真正未参与调参的 test
+- 结果容易偏乐观
+- 不能作为最终论文表格里的主结果
+
+因此当前推荐：
+
+- `train_val` 只用于前期快速试验
+- `train_val_test` 用于正式 teacher / student / baseline 比较
+
+### 24.2 同 cohort baseline 的含义
+
+当前最关键的公平性问题是：
+
+- `CT + CNV`
+- `CT + CNV + Text teacher`
+- `CT student`
+- `CT + Text student`
+
+这些 run 已经在同一个对齐 cohort 上。
+
+但：
+
+- `CT + Text`
+- `Text only`
+
+之前不一定在同一个对齐 cohort 上。
+
+所以“同 cohort baseline”指的是：
+
+- 先固定一份参考 `split_manifest.csv`
+- 再让普通 baseline 只在这同一批样本、同一划分上训练和验证
+
+项目里现在已经支持：
+
+- `--reference-manifest <RUN_DIR>/split_manifest.csv`
+
+它的作用是：
+
+- 把当前 run 的 cohort 过滤到参考 manifest 对应的 sample 集合
+- 直接复用参考 manifest 的 `train / val / test`
+
+这就是后面做公平横向对比的标准入口。
+
+### 24.3 当前最推荐的正式对比组
+
+以 `CT + CNV + Text teacher` 的 `split_manifest.csv` 为统一参考，最实用的一组正式对比是：
+
+1. `CT only baseline`
+2. `CT + Text baseline`
+3. `CT + CNV + Text teacher`
+4. `CT student + KD`
+5. `CT + Text student + KD`
+
+## 25. 当前更推荐的正式命令
+
+### 25.1 Teacher 正式版
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --gene-tsv <GENE_TSV> \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --output-dir outputs/ct_cnv_text_teacher_v1_tvt \
+  --modalities ct,cnv,text \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --use-predefined-split \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num
+```
+
+### 25.2 CT only baseline，同 cohort 对齐
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --output-dir outputs/ct_only_aligned_tvt \
+  --modalities ct \
+  --reference-manifest outputs/ct_cnv_text_teacher_v1_tvt/split_manifest.csv \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num
+```
+
+### 25.3 CT + Text baseline，同 cohort 对齐
+
+```bash
+python train_multimodal.py \
+  --data-root <DATA_ROOT> \
+  --metadata-csv <METADATA_CSV> \
+  --ct-root <CT_ROOT> \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --output-dir outputs/ct_text_aligned_tvt \
+  --modalities ct,text \
+  --reference-manifest outputs/ct_cnv_text_teacher_v1_tvt/split_manifest.csv \
+  --class-mode binary \
+  --binary-task malignant_vs_normal \
+  --selection-metric auroc \
+  --split-mode train_val_test \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num
+```
+
+### 25.4 CT student，同 cohort 对齐
+
+```bash
+python train_student_kd.py \
+  --output-dir outputs/ct_student_kd_v1_tvt \
+  --modalities ct \
+  --teacher-run-dir outputs/ct_cnv_text_teacher_v1_tvt \
+  --reference-manifest outputs/ct_cnv_text_teacher_v1_tvt/split_manifest.csv \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --distillation-alpha 0.5 \
+  --distillation-temperature 4.0
+```
+
+### 25.5 CT + Text student，同 cohort 对齐
+
+```bash
+python train_student_kd.py \
+  --output-dir outputs/ct_text_student_kd_v1_tvt \
+  --modalities ct,text \
+  --text-feature-tsv outputs/text_features_v1.tsv \
+  --teacher-run-dir outputs/ct_cnv_text_teacher_v1_tvt \
+  --reference-manifest outputs/ct_cnv_text_teacher_v1_tvt/split_manifest.csv \
+  --ct-model resnet3d18 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --epochs 30 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --distillation-alpha 0.5 \
+  --distillation-temperature 4.0
+```
+
+## 26. 当前更推荐的指标体系
+
+当前二分类主结果仍建议以：
+
+- `AUROC`
+
+作为 primary selection metric。
+
+原因：
+
+- 它是 threshold-free 指标
+- 对类别不均衡比单纯 `accuracy` 更稳
+- 更适合当前“排序能力 / 区分能力”优先的 teacher-student 设定
+
+但正式报告不能只看 `AUROC`。
+
+当前更完整的指标应包括：
+
+- `AUROC`
+- `AUPRC`
+- `accuracy`
+- `balanced_accuracy`
+- `precision`
+- `recall`
+- `sensitivity`
+- `specificity`
+- `F1`
+- `MCC`
+- `NPV`
+- `FPR`
+- `FNR`
+- `Youden J`
+- `Brier score`
+- `ECE`
+- `confusion_matrix`
+
+其中：
+
+- `recall` 和 `sensitivity` 在二分类里本来就是同一件事
+- 当前项目已经补上了更多校准和判别指标
+
+### 26.1 为什么高 accuracy 的 checkpoint 不一定保留
+
+这是正常现象。
+
+如果 checkpoint 按 `AUROC` 保留，那么：
+
+- 一个 `accuracy` 更高的点
+- 不一定有更好的整体排序能力
+
+尤其当前是二分类、而且你后面还要做：
+
+- teacher / student 比较
+- 外部验证
+- 阈值再设定
+
+这种情况下，用 `AUROC` 做主保留指标是合理的。
+
+但更严谨的做法是：
+
+- 保留 `AUROC` 作为主指标
+- 正式表里同时报告 `balanced_accuracy / sensitivity / specificity / MCC`
+
+## 27. 外部 bundle 评估
+
+当前已经补了外部 `bundle` 评估脚本：
+
+- `evaluate_bundle_ct.py`
+
+它更适合当前这些只有 CT 输入的 run：
+
+- `CT only baseline`
+- `CT student + KD`
+
+推荐命令：
+
+```bash
+python evaluate_bundle_ct.py \
+  --run-dir outputs/ct_student_kd_v1_tvt \
+  --output-dir outputs/ct_student_kd_v1_tvt_bundle_eval \
+  --data-root <DATA_ROOT> \
+  --bundle-nm-path <NM_ALL_NPY> \
+  --bundle-bn-path <BN_ALL_NPY> \
+  --bundle-mt-path <MT_ALL_NPY> \
+  --class-mode binary \
+  --binary-task malignant_vs_normal
+```
+
+这样得到的是：
+
+- 同一模型在外部 `bundle` 数据上的真实泛化结果
+
+后面最值得比较的一组是：
+
+1. `CT only baseline`
+2. `CT student + KD`
+
+## 28. 可视化
+
+当前已经补了实验可视化脚本：
+
+- `export_experiment_plots.py`
+
+当前可以直接导出：
+
+- `history_curves.png`
+- `binary_diagnostics.png`
+- `plot_summary.json`
+
+推荐命令：
+
+```bash
+python export_experiment_plots.py \
+  --run-dir outputs/ct_student_kd_v1_tvt \
+  --output-dir outputs/ct_student_kd_v1_tvt_plots \
+  --split val
+```
+
+对于二分类实验阶段，当前最值得优先积累的图有：
+
+1. 训练 history 曲线
+2. ROC 曲线
+3. PR 曲线
+4. confusion matrix
+5. calibration curve
+6. probability histogram
+
+这些图后面无论写论文还是内部汇报，都能直接复用。

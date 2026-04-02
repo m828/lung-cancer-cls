@@ -42,6 +42,7 @@ class MultiModalTrainConfig:
     metadata_csv: Path
     output_dir: Path
     modalities: Tuple[str, ...] = ("ct", "text", "cnv")
+    reference_manifest: Path | None = None
     ct_root: Path | None = None
     gene_tsv: Path | None = None
     text_feature_tsv: Path | None = None
@@ -717,12 +718,18 @@ def evaluate_model(
             "balanced_accuracy": None,
             "auroc": None,
             "auprc": None,
+            "mcc": None,
             "f1": None,
             "precision": None,
             "recall": None,
             "sensitivity": None,
             "specificity": None,
+            "npv": None,
+            "fpr": None,
+            "fnr": None,
+            "youden_j": None,
             "brier_score": None,
+            "ece": None,
             "confusion_matrix": [],
             "num_samples": 0,
         }
@@ -905,6 +912,34 @@ def load_split_manifest_indices(
     return train_idx, val_idx, test_idx
 
 
+def filter_cohort_to_manifest(
+    cohort: pd.DataFrame,
+    manifest_path: Path,
+) -> pd.DataFrame:
+    manifest = pd.read_csv(manifest_path).fillna("")
+    if "sample_id" not in manifest.columns:
+        raise ValueError(f"sample_id column not found in split manifest: {manifest_path}")
+    split_col = "assigned_split" if "assigned_split" in manifest.columns else "split"
+    manifest = manifest.copy()
+    manifest["sample_id"] = manifest["sample_id"].astype(str).str.strip()
+    manifest[split_col] = manifest[split_col].map(_normalize_split)
+    manifest = manifest.loc[
+        manifest["sample_id"].ne("") & manifest[split_col].isin({"train", "val", "test"})
+    ].drop_duplicates(subset=["sample_id"], keep="first")
+    manifest["_manifest_order"] = np.arange(len(manifest), dtype=np.int64)
+
+    filtered = cohort.merge(
+        manifest[["sample_id", split_col, "_manifest_order"]],
+        on="sample_id",
+        how="inner",
+    )
+    if filtered.empty:
+        raise RuntimeError(f"No overlapping samples remain after applying manifest: {manifest_path}")
+    filtered["split"] = filtered[split_col].map(_normalize_split)
+    filtered = filtered.sort_values("_manifest_order").drop(columns=[split_col, "_manifest_order"]).reset_index(drop=True)
+    return filtered
+
+
 def create_model_from_config(
     config: MultiModalTrainConfig,
     feature_info: Dict[str, Any],
@@ -1013,7 +1048,12 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
     print("=" * 60)
 
     cohort, feature_info, class_names, cohort_stats = build_multimodal_cohort(config, config.modalities)
-    train_idx, val_idx, test_idx, split_source = split_cohort(cohort, config)
+    if config.reference_manifest is not None:
+        cohort = filter_cohort_to_manifest(cohort, config.reference_manifest)
+        train_idx, val_idx, test_idx = load_split_manifest_indices(cohort, config.reference_manifest)
+        split_source = "reference_manifest"
+    else:
+        train_idx, val_idx, test_idx, split_source = split_cohort(cohort, config)
     if not train_idx:
         raise RuntimeError("Training split is empty.")
     save_split_manifest(config.output_dir / "split_manifest.csv", cohort, train_idx, val_idx, test_idx)
@@ -1167,6 +1207,7 @@ CONFIG_PATH_KEYS = {
     "data_root",
     "metadata_csv",
     "output_dir",
+    "reference_manifest",
     "ct_root",
     "gene_tsv",
     "text_feature_tsv",
@@ -1200,6 +1241,7 @@ def inherit_paths_from_teacher(
     for key in [
         "data_root",
         "metadata_csv",
+        "reference_manifest",
         "ct_root",
         "gene_tsv",
         "text_feature_tsv",
@@ -1253,7 +1295,12 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
 
     cohort, feature_info, class_names, cohort_stats = build_multimodal_cohort(config, required_modalities)
     teacher_manifest = config.teacher_run_dir / "split_manifest.csv"
-    if teacher_manifest.exists():
+    if config.reference_manifest is not None:
+        cohort = filter_cohort_to_manifest(cohort, config.reference_manifest)
+        train_idx, val_idx, test_idx = load_split_manifest_indices(cohort, config.reference_manifest)
+        split_source = "reference_manifest"
+    elif teacher_manifest.exists():
+        cohort = filter_cohort_to_manifest(cohort, teacher_manifest)
         train_idx, val_idx, test_idx = load_split_manifest_indices(cohort, teacher_manifest)
         split_source = "teacher_manifest"
     else:
@@ -1447,6 +1494,7 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--metadata-csv", type=Path, required=require_core_paths, default=None, help="Metadata CSV path.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Output directory.")
     parser.add_argument("--modalities", type=str, required=False, default="ct,text,cnv", help="Comma-separated modalities among ct,text,cnv.")
+    parser.add_argument("--reference-manifest", type=Path, default=None, help="Optional split_manifest.csv used to align the cohort and split with another run.")
     parser.add_argument("--ct-root", type=Path, default=None, help="CT .npy root directory.")
     parser.add_argument("--gene-tsv", type=Path, default=None, help="CNV / gene TSV path.")
     parser.add_argument("--text-feature-tsv", type=Path, default=None, help="Prepared text feature TSV path.")
@@ -1525,6 +1573,7 @@ def parse_train_args() -> MultiModalTrainConfig:
         metadata_csv=args.metadata_csv,
         output_dir=args.output_dir,
         modalities=normalize_modalities(args.modalities),
+        reference_manifest=args.reference_manifest,
         ct_root=args.ct_root,
         gene_tsv=args.gene_tsv,
         text_feature_tsv=args.text_feature_tsv,
@@ -1589,6 +1638,7 @@ def parse_student_args() -> StudentKDConfig:
         metadata_csv=args.metadata_csv,
         output_dir=args.output_dir,
         modalities=normalize_modalities(args.modalities),
+        reference_manifest=args.reference_manifest,
         ct_root=args.ct_root,
         gene_tsv=args.gene_tsv,
         text_feature_tsv=args.text_feature_tsv,

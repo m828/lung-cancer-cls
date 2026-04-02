@@ -7,6 +7,13 @@
 - [CT + CNV 多模态 V1 说明](./CT_CNV_MULTIMODAL_V1.md)
 - [文本模态、多模态教师网络与蒸馏说明](./TEXT_MULTIMODAL_KD_STAGE.md)
 
+当前实验阶段新增实用脚本：
+
+- `train_multimodal.py`
+- `train_student_kd.py`
+- `evaluate_bundle_ct.py`
+- `export_experiment_plots.py`
+
 一个可直接运行的 **肺癌 CT 三分类统一训练框架**，支持 IQ-OTH/NCCD、LUNA16、LIDC-IDRI 和内网 CT（`intranet_ct`）四个数据来源，确保数据划分、模型训练及验证的方式一致，方便对比和查看结果。
 
 ## 1. 目标

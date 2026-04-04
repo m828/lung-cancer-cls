@@ -7,6 +7,7 @@
 - [CT + CNV 多模态 V1 说明](./CT_CNV_MULTIMODAL_V1.md)
 - [文本模态、多模态教师网络与蒸馏说明](./TEXT_MULTIMODAL_KD_STAGE.md)
 - [临床动机、论文定位与审稿人应对笔记](./CLINICAL_POSITIONING_AND_PAPER_NOTES.md)
+- [LIDC-IDRI 基线、优化点与 student 验证路线](./LIDC_IDRI_BENCHMARK_NOTES.md)
 
 当前实验阶段新增实用脚本：
 
@@ -119,6 +120,7 @@ python train.py \
   --output-dir outputs/lidc_idri_resnet18 \
   --model resnet18 \
   --pretrained \
+  --group-split-mode nodule \
   --split-mode train_val_test \
   --epochs 30
 
@@ -128,6 +130,7 @@ python train.py \
   --data-root /workspace/data-lung/lidc_idri_slices \
   --output-dir outputs/lidc_idri_train_val_only \
   --model resnet18 \
+  --group-split-mode nodule \
   --split-mode train_val \
   --epochs 30
 
@@ -143,9 +146,61 @@ python train.py \
   --data-root /workspace/data-lung/lidc_idri_3d_npy \
   --output-dir outputs/lidc_idri_swin3d \
   --model swin3d_tiny --pretrained \
+  --group-split-mode nodule \
   --split-mode train_val \
   --epochs 30
 ```
+
+如果要更贴近 `LIDC-IDRI` 文献中的主流 benchmark，当前更推荐优先尝试：
+
+```bash
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_3d_npy \
+  --output-dir outputs/lidc_bvm_resnet3d18 \
+  --model resnet3d18 \
+  --pretrained \
+  --use-3d-input \
+  --group-split-mode nodule \
+  --class-mode binary \
+  --binary-task benign_vs_malignant \
+  --split-mode train_val_test \
+  --epochs 40 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --selection-metric auroc
+```
+
+如果你想验证内部蒸馏得到的 `CT student` 是否对公开数据迁移有帮助，也可以在同一设置下继续微调：
+
+```bash
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_3d_npy \
+  --output-dir outputs/lidc_bvm_resnet3d18_student_init \
+  --model resnet3d18 \
+  --use-3d-input \
+  --group-split-mode nodule \
+  --class-mode binary \
+  --binary-task benign_vs_malignant \
+  --split-mode train_val_test \
+  --epochs 40 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --selection-metric auroc \
+  --init-checkpoint outputs/ct_student_kd_v1_tvt/best_model.pt \
+  --init-checkpoint-prefix ct_encoder.
+```
+
+更完整的原因分析、文献设定和推荐实验顺序，见：
+
+- [LIDC_IDRI_BENCHMARK_NOTES.md](./LIDC_IDRI_BENCHMARK_NOTES.md)
 
 ## 5. 统一参数说明
 

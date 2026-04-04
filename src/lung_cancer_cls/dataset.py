@@ -475,15 +475,19 @@ class LIDCIDRIDataset(BaseCTDataset):
                 continue
             label = CLASS_NAME_TO_ID[canonical]
 
-            for p in label_dir.iterdir():
+            for p in label_dir.rglob("*"):
                 if not p.is_file():
                     continue
+                metadata = None
+                rel_parent = p.relative_to(label_dir).parent
+                if rel_parent != Path("."):
+                    metadata = {"relative_parent": rel_parent.as_posix()}
                 if use_3d:
                     if p.suffix.lower() == ".npy":
-                        samples.append(Sample(image_path=p, label=label))
+                        samples.append(Sample(image_path=p, label=label, metadata=metadata))
                 else:
                     if p.suffix.lower() in IMG_EXTS:
-                        samples.append(Sample(image_path=p, label=label))
+                        samples.append(Sample(image_path=p, label=label, metadata=metadata))
 
         if not samples:
             raise RuntimeError(

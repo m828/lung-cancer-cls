@@ -273,7 +273,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bundle-bn-path", type=Path, default=None, help="Path to BN_all.npy or directory.")
     parser.add_argument("--bundle-mt-path", type=Path, default=None, help="Path to MT_all.npy or directory.")
     parser.add_argument("--class-mode", type=str, choices=["multiclass", "binary"], default=None)
-    parser.add_argument("--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal"], default=None)
+    parser.add_argument("--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal", "benign_vs_malignant"], default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--cpu", action="store_true")

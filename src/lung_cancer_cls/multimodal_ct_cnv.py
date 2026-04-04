@@ -752,7 +752,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gene-id-col", type=str, default=None, help="Gene TSV ID column.")
     parser.add_argument("--gene-label-col", type=str, default=None, help="Gene TSV label column to drop from features.")
     parser.add_argument("--class-mode", type=str, choices=["multiclass", "binary"], default="binary")
-    parser.add_argument("--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal"], default="malignant_vs_normal")
+    parser.add_argument("--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal", "benign_vs_malignant"], default="malignant_vs_normal")
     parser.add_argument("--selection-metric", type=str, choices=["auto", "accuracy", "balanced_accuracy", "auroc", "auprc", "f1", "loss"], default="auto")
     parser.add_argument("--split-mode", type=str, choices=["train_val", "train_val_test"], default="train_val_test")
     parser.add_argument("--use-predefined-split", action="store_true", help="Use metadata split labels when available.")

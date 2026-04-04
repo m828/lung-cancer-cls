@@ -58,6 +58,17 @@ def preprocess(arr: np.ndarray, depth: int, hw: int) -> np.ndarray:
     return out
 
 
+def build_output_stem(src_dir: Path, path: Path) -> str:
+    rel = path.relative_to(src_dir)
+    rel_no_suffix = rel
+    if rel.name.lower().endswith(".nii.gz"):
+        rel_no_suffix = rel.with_name(rel.name[:-7])
+    else:
+        rel_no_suffix = rel.with_suffix("")
+    parts = [part for part in rel_no_suffix.parts if part not in {"."}]
+    return "__".join(parts)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare LIDC-IDRI 3D volumes into normalized .npy tensors")
     parser.add_argument("--input-root", type=str, required=True)
@@ -80,7 +91,7 @@ def main() -> None:
         dst_dir = output_root / cls_name
         dst_dir.mkdir(parents=True, exist_ok=True)
 
-        for p in src_dir.iterdir():
+        for p in src_dir.rglob("*"):
             if not p.is_file():
                 continue
             if not (
@@ -90,10 +101,8 @@ def main() -> None:
                 continue
             vol = load_volume(p)
             vol = preprocess(vol, depth=args.depth_size, hw=args.image_size)
-            out_name = p.name
-            if out_name.lower().endswith(".nii.gz"):
-                out_name = out_name[:-7]
-            out_path = dst_dir / (Path(out_name).stem + ".npy")
+            out_stem = build_output_stem(src_dir, p)
+            out_path = dst_dir / f"{out_stem}.npy"
             np.save(out_path, vol)
             count += 1
 

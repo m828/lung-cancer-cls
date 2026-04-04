@@ -2,10 +2,18 @@ from pathlib import Path
 
 import pytest
 import pandas as pd
+import torch
 from PIL import Image
 
-from lung_cancer_cls.dataset import DatasetType, create_dataset
-from lung_cancer_cls.train import TrainConfig, train_model
+from lung_cancer_cls.dataset import DatasetType, Sample, create_dataset
+from lung_cancer_cls.train import (
+    TrainConfig,
+    infer_group_ids,
+    infer_lidc_group_id,
+    load_compatible_init_weights,
+    stratified_group_split,
+    train_model,
+)
 
 
 def _write_img(path: Path) -> None:
@@ -83,6 +91,42 @@ def test_lidc_idri_3d_discovery_and_loading(tmp_path: Path):
     x, y = dataset[0]
     assert x.shape == (1, 12, 128, 128)
     assert y in [0, 1, 2]
+
+
+def test_lidc_idri_recursive_discovery_preserves_relative_parent(tmp_path: Path):
+    _write_img(tmp_path / "benign" / "LIDC-IDRI-0001" / "nodule_1" / "slice_01.png")
+    _write_img(tmp_path / "malignant" / "LIDC-IDRI-0002" / "nodule_3" / "slice_02.png")
+
+    dataset = create_dataset(DatasetType.LIDC_IDRI, tmp_path)
+    samples = dataset.get_samples()
+    assert len(samples) == 2
+    rel_parents = sorted((sample.metadata or {}).get("relative_parent") for sample in samples)
+    assert rel_parents == ["LIDC-IDRI-0001/nodule_1", "LIDC-IDRI-0002/nodule_3"]
+
+
+def test_lidc_group_inference_and_group_split():
+    samples = [
+        Sample(image_path=Path("benign/LIDC-IDRI-0001_nodule_1_slice_01.png"), label=1),
+        Sample(image_path=Path("benign/LIDC-IDRI-0001_nodule_1_slice_02.png"), label=1),
+        Sample(image_path=Path("malignant/LIDC-IDRI-0002_nodule_1_slice_01.png"), label=2),
+        Sample(image_path=Path("malignant/LIDC-IDRI-0002_nodule_1_slice_02.png"), label=2),
+    ]
+
+    group_ids = infer_group_ids(samples, DatasetType.LIDC_IDRI, "nodule")
+    assert group_ids is not None
+    assert infer_lidc_group_id(samples[0], "patient") == "LIDC-IDRI-0001"
+    train_idx, val_idx, test_idx = stratified_group_split(samples, group_ids, train_ratio=0.5, seed=42)
+
+    split_by_index = {}
+    for idx in train_idx:
+        split_by_index[idx] = "train"
+    for idx in val_idx:
+        split_by_index[idx] = "val"
+    for idx in test_idx:
+        split_by_index[idx] = "test"
+
+    assert split_by_index[0] == split_by_index[1]
+    assert split_by_index[2] == split_by_index[3]
 
 
 def test_intranet_ct_discovery(tmp_path: Path):
@@ -255,3 +299,60 @@ def test_binary_class_mode_train_smoke(tmp_path: Path):
     assert metrics["config"]["class_mode"] == "binary"
     assert metrics["config"]["binary_task"] == "malignant_vs_rest"
     assert metrics["class_names"] == {0: "non_malignant", 1: "malignant"}
+
+
+def test_benign_vs_malignant_binary_task_smoke(tmp_path: Path):
+    import numpy as np
+
+    for cls_name in ["normal", "benign", "malignant"]:
+        d = tmp_path / cls_name
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(2):
+            np.save(d / f"{cls_name}_{idx}.npy", np.random.randn(8, 16, 16).astype("float32"))
+
+    cfg = TrainConfig(
+        dataset_type=DatasetType.LIDC_IDRI,
+        data_root=tmp_path,
+        output_dir=tmp_path / "out_bvm",
+        epochs=1,
+        batch_size=2,
+        num_workers=0,
+        cpu=True,
+        use_3d_input=True,
+        depth_size=8,
+        volume_hw=32,
+        model="attention3d_cnn",
+        class_mode="binary",
+        binary_task="benign_vs_malignant",
+        split_mode="train_val",
+    )
+    metrics = train_model(cfg)
+    assert metrics["config"]["binary_task"] == "benign_vs_malignant"
+    assert metrics["class_names"] == {0: "benign", 1: "malignant"}
+
+
+def test_load_compatible_init_weights_with_prefix(tmp_path: Path):
+    model = torch.nn.Linear(4, 2)
+    ckpt = tmp_path / "student_like.pt"
+    expected_weight = torch.randn_like(model.weight)
+    expected_bias = torch.randn_like(model.bias)
+
+    torch.save(
+        {
+            "ct_encoder.weight": expected_weight.clone(),
+            "ct_encoder.bias": expected_bias.clone(),
+            "ct_encoder.unused": torch.randn(3),
+        },
+        ckpt,
+    )
+
+    info = load_compatible_init_weights(
+        model,
+        ckpt,
+        torch.device("cpu"),
+        prefix="ct_encoder.",
+    )
+
+    assert info["loaded_keys"] == 2
+    assert torch.allclose(model.weight, expected_weight)
+    assert torch.allclose(model.bias, expected_bias)

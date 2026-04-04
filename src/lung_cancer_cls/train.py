@@ -4,8 +4,9 @@ import argparse
 import json
 import math
 import random
+import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -93,6 +94,8 @@ class TrainConfig:
     finetune_epochs: int = 10
     finetune_lr: float = 1e-4
     init_checkpoint: Path | None = None
+    init_checkpoint_prefix: str | None = None
+    group_split_mode: str = "auto"
 
 
 MULTICLASS_NAMES = {
@@ -148,6 +151,15 @@ def remap_samples_by_class_mode(
         ]
         return remapped, class_names
 
+    elif task == "benign_vs_malignant":
+        class_names = {0: "benign", 1: "malignant"}
+        remapped = [
+            replace(sample, label=1 if sample.label == 2 else 0)
+            for sample in samples
+            if sample.label in {1, 2}
+        ]
+        return remapped, class_names
+
     else:
         raise ValueError(f"Unknown binary_task: {binary_task}")
 
@@ -172,6 +184,210 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _unwrap_checkpoint_state(raw_state: Any) -> Dict[str, torch.Tensor]:
+    if isinstance(raw_state, dict):
+        for key in ["state_dict", "model_state_dict", "model"]:
+            nested = raw_state.get(key)
+            if isinstance(nested, dict):
+                return nested
+        if all(isinstance(k, str) for k in raw_state.keys()):
+            return raw_state
+    raise ValueError("Unsupported checkpoint format; expected a state_dict-like mapping.")
+
+
+def load_compatible_init_weights(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    prefix: str | None = None,
+) -> Dict[str, Any]:
+    raw_state = torch.load(checkpoint_path, map_location=device)
+    state_dict = _unwrap_checkpoint_state(raw_state)
+
+    normalized: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if not isinstance(key, str):
+            continue
+        normalized[key[7:] if key.startswith("module.") else key] = value
+
+    if prefix:
+        normalized = {
+            key[len(prefix):]: value
+            for key, value in normalized.items()
+            if key.startswith(prefix)
+        }
+
+    model_state = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in normalized.items()
+        if key in model_state and getattr(value, "shape", None) == model_state[key].shape
+    }
+
+    if not compatible:
+        print(f"未找到可兼容的初始权重: {checkpoint_path}")
+        if prefix:
+            print(f"已按前缀过滤: {prefix}")
+        return {
+            "loaded_keys": 0,
+            "skipped_keys": int(len(normalized)),
+            "used_prefix": prefix,
+        }
+
+    model.load_state_dict(compatible, strict=False)
+    skipped = max(0, len(normalized) - len(compatible))
+    print(f"加载初始权重: {checkpoint_path}")
+    if prefix:
+        print(f"加载前缀: {prefix}")
+    print(f"兼容参数: {len(compatible)}, 跳过参数: {skipped}")
+    return {
+        "loaded_keys": int(len(compatible)),
+        "skipped_keys": int(skipped),
+        "used_prefix": prefix,
+    }
+
+
+def infer_lidc_group_id(sample: Sample, mode: str = "auto") -> str | None:
+    mode = mode.lower().strip()
+    if mode == "none":
+        return None
+
+    if sample.metadata and sample.metadata.get("group_id"):
+        return str(sample.metadata["group_id"])
+
+    rel_parent = ""
+    if sample.metadata and sample.metadata.get("relative_parent"):
+        rel_parent = str(sample.metadata["relative_parent"])
+
+    path_text = f"{sample.image_path.as_posix()}::{rel_parent}"
+    stem = sample.image_path.stem
+    stem = stem[:-4] if stem.lower().endswith(".nii") else stem
+
+    patient_match = re.search(r"(LIDC-IDRI-\d{4})", path_text, flags=re.IGNORECASE)
+    if patient_match:
+        patient_id = patient_match.group(1).upper()
+    else:
+        patient_match = re.search(r"\b(patient|case|scan|subject)[_-]?(\d{2,})\b", path_text, flags=re.IGNORECASE)
+        patient_id = f"{patient_match.group(1).lower()}_{patient_match.group(2)}" if patient_match else None
+
+    nodule_match = re.search(r"\b(nodule|nod|lesion|roi|cluster|ann|annotation)[_-]?([A-Za-z0-9]+)\b", path_text, flags=re.IGNORECASE)
+    nodule_id = f"{nodule_match.group(1).lower()}_{nodule_match.group(2)}" if nodule_match else None
+
+    tail = stem
+    if patient_id and patient_id in tail:
+        tail = tail.split(patient_id, 1)[1].lstrip("_- ")
+    tail = re.sub(r"(?i)([_-]?(slice|img|image|patch|frame|axial|z)[_-]?\d+)$", "", tail).strip("_- ")
+    tail = re.sub(r"[_-]\d{1,4}$", "", tail).strip("_- ")
+
+    if mode == "patient":
+        return patient_id or rel_parent or None
+
+    if mode in {"nodule", "auto"}:
+        if patient_id and nodule_id:
+            return f"{patient_id}__{nodule_id}"
+        if patient_id and tail:
+            return f"{patient_id}__{tail}"
+        if rel_parent:
+            return rel_parent.replace("/", "__")
+        if tail and tail != stem:
+            return tail
+        if mode == "nodule":
+            return None
+
+    return patient_id or rel_parent or None
+
+
+def infer_group_ids(
+    samples: Sequence[Sample],
+    dataset_type: DatasetType,
+    mode: str,
+) -> List[str] | None:
+    mode = mode.lower().strip()
+    if mode == "none":
+        return None
+    if dataset_type != DatasetType.LIDC_IDRI:
+        return None
+
+    group_ids = [infer_lidc_group_id(sample, mode=mode) for sample in samples]
+    if any(group_id is None for group_id in group_ids):
+        return None
+    if len(set(group_ids)) == len(group_ids):
+        return None
+    return [str(group_id) for group_id in group_ids]
+
+
+def _safe_group_train_test_split(
+    group_items: List[Tuple[str, List[int], str]],
+    test_size: float,
+    seed: int,
+) -> Tuple[List[Tuple[str, List[int], str]], List[Tuple[str, List[int], str]]]:
+    from sklearn.model_selection import train_test_split
+
+    if len(group_items) <= 1:
+        return group_items, []
+
+    labels = [item[2] for item in group_items]
+    use_stratify = len(set(labels)) > 1 and min(labels.count(label) for label in set(labels)) >= 2
+    train_items, test_items = train_test_split(
+        group_items,
+        test_size=test_size,
+        random_state=seed,
+        shuffle=True,
+        stratify=labels if use_stratify else None,
+    )
+    return list(train_items), list(test_items)
+
+
+def stratified_group_split(
+    samples: Sequence[Sample],
+    group_ids: Sequence[str],
+    train_ratio: float,
+    seed: int,
+) -> Tuple[List[int], List[int], List[int]]:
+    group_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for idx, group_id in enumerate(group_ids):
+        group_to_indices[str(group_id)].append(idx)
+
+    group_items: List[Tuple[str, List[int], str]] = []
+    for group_id, idxs in group_to_indices.items():
+        labels = sorted({samples[idx].label for idx in idxs})
+        label_signature = "|".join(str(label) for label in labels)
+        group_items.append((group_id, idxs, label_signature))
+
+    train_groups, temp_groups = _safe_group_train_test_split(group_items, test_size=(1 - train_ratio), seed=seed)
+    if len(temp_groups) <= 1:
+        train_idx = [idx for _, idxs, _ in group_items for idx in idxs]
+        return train_idx, [], []
+
+    val_groups, test_groups = _safe_group_train_test_split(temp_groups, test_size=0.5, seed=seed)
+    train_idx = [idx for _, idxs, _ in train_groups for idx in idxs]
+    val_idx = [idx for _, idxs, _ in val_groups for idx in idxs]
+    test_idx = [idx for _, idxs, _ in test_groups for idx in idxs]
+    return train_idx, val_idx, test_idx
+
+
+def stratified_group_train_val_split(
+    samples: Sequence[Sample],
+    group_ids: Sequence[str],
+    train_ratio: float,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
+    group_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for idx, group_id in enumerate(group_ids):
+        group_to_indices[str(group_id)].append(idx)
+
+    group_items: List[Tuple[str, List[int], str]] = []
+    for group_id, idxs in group_to_indices.items():
+        labels = sorted({samples[idx].label for idx in idxs})
+        label_signature = "|".join(str(label) for label in labels)
+        group_items.append((group_id, idxs, label_signature))
+
+    train_groups, val_groups = _safe_group_train_test_split(group_items, test_size=(1 - train_ratio), seed=seed)
+    train_idx = [idx for _, idxs, _ in train_groups for idx in idxs]
+    val_idx = [idx for _, idxs, _ in val_groups for idx in idxs]
+    return train_idx, val_idx
 
 
 def stratified_split(
@@ -647,11 +863,39 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         print(f"  {class_name} (label={label}): {label_counts.get(label, 0)}")
 
     # 2. 数据划分
-    if config.split_mode == "train_val":
-        train_idx, val_idx = stratified_train_val_split(samples, config.train_ratio, config.seed)
-        test_idx: List[int] = []
+    split_info: Dict[str, Any] = {
+        "requested_group_split_mode": config.group_split_mode,
+        "used_group_split_mode": "none",
+        "num_groups": None,
+        "num_repeated_groups": None,
+    }
+    group_ids = infer_group_ids(samples, config.dataset_type, config.group_split_mode)
+    if group_ids is not None:
+        repeated_groups = sum(1 for count in Counter(group_ids).values() if count > 1)
+        split_info.update(
+            {
+                "used_group_split_mode": config.group_split_mode,
+                "num_groups": int(len(set(group_ids))),
+                "num_repeated_groups": int(repeated_groups),
+            }
+        )
+        if config.split_mode == "train_val":
+            train_idx, val_idx = stratified_group_train_val_split(samples, group_ids, config.train_ratio, config.seed)
+            test_idx = []
+        else:
+            train_idx, val_idx, test_idx = stratified_group_split(samples, group_ids, config.train_ratio, config.seed)
+        print(
+            f"使用 group split: mode={config.group_split_mode}, "
+            f"groups={split_info['num_groups']}, repeated_groups={split_info['num_repeated_groups']}"
+        )
     else:
-        train_idx, val_idx, test_idx = stratified_split(samples, config.train_ratio, config.seed)
+        if config.group_split_mode != "none" and config.dataset_type == DatasetType.LIDC_IDRI:
+            print(f"group split 未生效，回退到样本级分层划分: mode={config.group_split_mode}")
+        if config.split_mode == "train_val":
+            train_idx, val_idx = stratified_train_val_split(samples, config.train_ratio, config.seed)
+            test_idx = []
+        else:
+            train_idx, val_idx, test_idx = stratified_split(samples, config.train_ratio, config.seed)
 
     # 可选：使用数据表中的预定义划分（适合内网数据）
     if config.use_predefined_split:
@@ -844,10 +1088,14 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         num_classes=num_classes,
         pretrained=config.pretrained,
     ).to(device)
+    init_load_info = None
     if config.init_checkpoint is not None and config.init_checkpoint.exists():
-        state = torch.load(config.init_checkpoint, map_location=device)
-        model.load_state_dict(state, strict=False)
-        print(f"加载初始权重: {config.init_checkpoint}")
+        init_load_info = load_compatible_init_weights(
+            model,
+            config.init_checkpoint,
+            device,
+            prefix=config.init_checkpoint_prefix,
+        )
 
     optimizer = create_optimizer(
         config.optimizer_name,
@@ -991,6 +1239,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "sampling_strategy": config.sampling_strategy,
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
+            "group_split_mode": config.group_split_mode,
             "split_mode": config.split_mode,
             "loss_name": config.loss_name,
             "mask_txt": str(config.mask_txt) if config.mask_txt else None,
@@ -1006,8 +1255,12 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "finetune_epochs": config.finetune_epochs,
             "finetune_lr": config.finetune_lr,
             "init_checkpoint": str(config.init_checkpoint) if config.init_checkpoint else None,
+            "init_checkpoint_prefix": config.init_checkpoint_prefix,
         }
     }
+    metrics["split_info"] = split_info
+    if init_load_info is not None:
+        metrics["init_load_info"] = init_load_info
 
     with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1206,7 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="分类任务模式：multiclass / binary"
     )
     parser.add_argument(
-        "--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal"], default="malignant_vs_rest",
+        "--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal", "benign_vs_malignant"], default="malignant_vs_rest",
         help="二分类标签折叠方式"
     )
     parser.add_argument(
@@ -1216,6 +1469,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--effective-num-beta", type=float, default=0.999,
         help="effective_num 权重的 beta 参数"
+    )
+    parser.add_argument(
+        "--init-checkpoint", type=str, default=None,
+        help="Optional checkpoint used to initialize compatible weights before fine-tuning."
+    )
+    parser.add_argument(
+        "--init-checkpoint-prefix", type=str, default=None,
+        help="Optional key prefix to strip when loading init weights, e.g. ct_encoder."
+    )
+    parser.add_argument(
+        "--group-split-mode", type=str, choices=["none", "auto", "patient", "nodule"], default="auto",
+        help="Split LIDC-IDRI by detected patient or nodule groups when possible."
     )
     parser.add_argument("--use-3d-input", action="store_true", help="启用 3D 体输入（仅内网 .npy）")
     parser.add_argument("--depth-size", type=int, default=32, help="3D 输入重采样深度")
@@ -1285,6 +1550,9 @@ def train_main(args: argparse.Namespace) -> Dict[str, Any]:
         two_stage_bundle_to_csv=args.two_stage_bundle_to_csv,
         finetune_epochs=args.finetune_epochs,
         finetune_lr=args.finetune_lr,
+        init_checkpoint=Path(args.init_checkpoint) if args.init_checkpoint else None,
+        init_checkpoint_prefix=args.init_checkpoint_prefix,
+        group_split_mode=args.group_split_mode,
     )
     if config.two_stage_bundle_to_csv:
         return train_bundle_then_finetune_csv(config)

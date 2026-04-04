@@ -1246,3 +1246,27 @@ python export_experiment_plots.py \
 6. probability histogram
 
 这些图后面无论写论文还是内部汇报，都能直接复用。
+
+## 29. 临床动机与论文定位补充
+
+针对当前这条 `CT + CNV + Text teacher -> CT / CT + Text student` 路线，已经单独补了一份更适合后续写论文、答辩和回复审稿意见的说明：
+
+- [CLINICAL_POSITIONING_AND_PAPER_NOTES.md](./CLINICAL_POSITIONING_AND_PAPER_NOTES.md)
+
+这份文档重点回答了几个当前最关键的问题：
+
+1. 为什么 `CNV / 基因` 和 `knowledge distillation` 是临床驱动，而不是技术堆砌
+2. 为什么当前阶段先做 `malignant vs normal`
+3. 如果审稿人质疑任务“过容易”或“临床价值不足”，应该怎样回应
+4. 论文主线更适合如何表述
+5. 当前最推荐的 contribution、discussion 和后续实验叙事
+
+当前更稳的项目定位是：
+
+- 不是声称“良恶性鉴别问题已经解决”
+- 而是验证“少量包含基因信息的患者，能否帮助训练出对大多数无基因患者也可部署的更强模型”
+
+这部分内容和本阶段实验是配套的：
+
+- 实验主线仍按本文件里的 `teacher / baseline / student / bundle external eval` 推进
+- 论文与汇报叙事则优先参考新文档中的定位与措辞建议

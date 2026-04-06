@@ -31,6 +31,31 @@ class LIDCSplitConfig:
     nodule_col: str | None = None
     malignancy_col: str | None = None
     path_col: str | None = None
+    annotation_policy: str = "consensus"
+    consensus_min_readers: int = 1
+    xy_tolerance_px: float = 15.0
+    z_tolerance_mm: float = 3.0
+
+
+@dataclass
+class XMLAnnotation:
+    patient_id: str
+    xml_path: Path
+    reader_id: int
+    nodule_id: str
+    malignancy_score: float
+    x_center: float
+    y_center: float
+    z_center: float
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    z_min: float
+    z_max: float
+    approx_diameter_xy: float
+    roi_count: int
+    point_count: int
 
 
 def normalize_column_name(name: str) -> str:
@@ -305,6 +330,219 @@ def find_xml_files(patient_root: Path) -> List[Path]:
     return sorted(path for path in patient_root.rglob("*.xml") if path.is_file())
 
 
+def _findall_variants(element: ET.Element, variants: Sequence[str], ns: Dict[str, str]) -> List[ET.Element]:
+    for variant in variants:
+        nodes = element.findall(variant, ns)
+        if nodes:
+            return nodes
+    return []
+
+
+def _parse_xml_annotation(
+    patient_id: str,
+    xml_path: Path,
+    reader_idx: int,
+    nodule: ET.Element,
+    ns: Dict[str, str],
+) -> XMLAnnotation | None:
+    nodule_id = _xml_text(nodule, "nih:noduleID", ns) or _xml_text(nodule, "noduleID", ns)
+    chars = nodule.find("nih:characteristics", ns) or nodule.find("characteristics")
+    malignancy_text = _xml_text(chars, "nih:malignancy", ns) or _xml_text(chars, "malignancy", ns)
+    if malignancy_text is None:
+        return None
+    try:
+        malignancy_score = float(malignancy_text)
+    except ValueError:
+        return None
+
+    roi_nodes = _findall_variants(nodule, [".//nih:roi", ".//roi"], ns)
+    if not roi_nodes:
+        return None
+
+    xs: List[float] = []
+    ys: List[float] = []
+    zs: List[float] = []
+    roi_count = 0
+
+    for roi in roi_nodes:
+        z_text = _xml_text(roi, "nih:imageZposition", ns) or _xml_text(roi, "imageZposition", ns)
+        if z_text is None:
+            continue
+        try:
+            z_value = float(z_text)
+        except ValueError:
+            continue
+
+        edge_maps = _findall_variants(roi, [".//nih:edgeMap", ".//edgeMap"], ns)
+        roi_points = 0
+        for edge in edge_maps:
+            x_text = _xml_text(edge, "nih:xCoord", ns) or _xml_text(edge, "xCoord", ns)
+            y_text = _xml_text(edge, "nih:yCoord", ns) or _xml_text(edge, "yCoord", ns)
+            if x_text is None or y_text is None:
+                continue
+            try:
+                xs.append(float(x_text))
+                ys.append(float(y_text))
+                zs.append(z_value)
+                roi_points += 1
+            except ValueError:
+                continue
+        if roi_points > 0:
+            roi_count += 1
+
+    if not xs or not ys or not zs:
+        return None
+
+    x_min = float(min(xs))
+    x_max = float(max(xs))
+    y_min = float(min(ys))
+    y_max = float(max(ys))
+    z_min = float(min(zs))
+    z_max = float(max(zs))
+    approx_diameter_xy = float(max(x_max - x_min, y_max - y_min))
+    derived_nodule_id = re.sub(r"\s+", "_", nodule_id or f"reader{reader_idx}_nodule")
+
+    return XMLAnnotation(
+        patient_id=patient_id,
+        xml_path=xml_path,
+        reader_id=reader_idx,
+        nodule_id=derived_nodule_id,
+        malignancy_score=malignancy_score,
+        x_center=float(np.mean(xs)),
+        y_center=float(np.mean(ys)),
+        z_center=float(np.mean(zs)),
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        z_min=z_min,
+        z_max=z_max,
+        approx_diameter_xy=approx_diameter_xy,
+        roi_count=int(roi_count),
+        point_count=int(len(xs)),
+    )
+
+
+def _annotations_match(
+    left: XMLAnnotation,
+    right: XMLAnnotation,
+    xy_tolerance_px: float,
+    z_tolerance_mm: float,
+) -> bool:
+    if left.patient_id != right.patient_id:
+        return False
+    if left.xml_path != right.xml_path:
+        return False
+    if left.reader_id == right.reader_id:
+        return False
+
+    left_z_min = left.z_min - z_tolerance_mm
+    left_z_max = left.z_max + z_tolerance_mm
+    right_z_min = right.z_min - z_tolerance_mm
+    right_z_max = right.z_max + z_tolerance_mm
+    z_overlaps = min(left_z_max, right_z_max) >= max(left_z_min, right_z_min)
+    if not z_overlaps:
+        return False
+
+    xy_distance = float(np.hypot(left.x_center - right.x_center, left.y_center - right.y_center))
+    adaptive_xy_tol = max(
+        xy_tolerance_px,
+        0.5 * max(left.approx_diameter_xy, right.approx_diameter_xy),
+    )
+    return xy_distance <= adaptive_xy_tol
+
+
+def _cluster_series_annotations(
+    annotations: Sequence[XMLAnnotation],
+    xy_tolerance_px: float,
+    z_tolerance_mm: float,
+) -> List[List[XMLAnnotation]]:
+    if not annotations:
+        return []
+
+    parent = list(range(len(annotations)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(left_idx: int, right_idx: int) -> None:
+        left_root = find(left_idx)
+        right_root = find(right_idx)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_idx in range(len(annotations)):
+        for right_idx in range(left_idx + 1, len(annotations)):
+            if _annotations_match(
+                annotations[left_idx],
+                annotations[right_idx],
+                xy_tolerance_px=xy_tolerance_px,
+                z_tolerance_mm=z_tolerance_mm,
+            ):
+                union(left_idx, right_idx)
+
+    clusters: Dict[int, List[XMLAnnotation]] = {}
+    for idx, annotation in enumerate(annotations):
+        clusters.setdefault(find(idx), []).append(annotation)
+    return list(clusters.values())
+
+
+def _build_consensus_record(
+    cluster: Sequence[XMLAnnotation],
+    cluster_idx: int,
+    label_policy: str,
+    consensus_min_readers: int,
+) -> Dict[str, Any] | None:
+    unique_readers = sorted({annotation.reader_id for annotation in cluster})
+    if len(unique_readers) < consensus_min_readers:
+        return None
+
+    malignancy_score = float(np.mean([annotation.malignancy_score for annotation in cluster]))
+    label_info = score_to_binary_label(malignancy_score, label_policy)
+    if label_info is None:
+        return None
+    label, class_name = label_info
+
+    patient_id = cluster[0].patient_id
+    xml_path = cluster[0].xml_path
+    series_token = re.sub(r"[^A-Za-z0-9._-]+", "_", xml_path.parent.name or xml_path.stem)
+    nodule_id = f"{series_token}__cluster_{cluster_idx:04d}"
+    sample_id = f"{patient_id}__{nodule_id}"
+    scores = [annotation.malignancy_score for annotation in cluster]
+
+    return {
+        "sample_id": sample_id,
+        "patient_id": patient_id,
+        "nodule_id": nodule_id,
+        "label": int(label),
+        "class_name": class_name,
+        "malignancy_score": malignancy_score,
+        "score_source": "xml_consensus",
+        "source_path": "",
+        "patient_dir": str(xml_path.parents[2]) if len(xml_path.parents) >= 3 else "",
+        "metadata_row": -1,
+        "xml_path": str(xml_path),
+        "reader_id": -1,
+        "z_center": float(np.mean([annotation.z_center for annotation in cluster])),
+        "z_min": float(min(annotation.z_min for annotation in cluster)),
+        "z_max": float(max(annotation.z_max for annotation in cluster)),
+        "x_center": float(np.mean([annotation.x_center for annotation in cluster])),
+        "y_center": float(np.mean([annotation.y_center for annotation in cluster])),
+        "x_min": float(min(annotation.x_min for annotation in cluster)),
+        "x_max": float(max(annotation.x_max for annotation in cluster)),
+        "y_min": float(min(annotation.y_min for annotation in cluster)),
+        "y_max": float(max(annotation.y_max for annotation in cluster)),
+        "num_readers": int(len(unique_readers)),
+        "annotation_count": int(len(cluster)),
+        "reader_ids": json.dumps(unique_readers),
+        "reader_nodule_ids": json.dumps([annotation.nodule_id for annotation in cluster]),
+        "malignancy_scores": json.dumps(scores),
+    }
+
+
 def build_manifest_from_xml(config: LIDCSplitConfig) -> pd.DataFrame:
     patient_root = resolve_patient_root(config.input_root)
     xml_files = find_xml_files(patient_root)
@@ -314,6 +552,11 @@ def build_manifest_from_xml(config: LIDCSplitConfig) -> pd.DataFrame:
     ns = {"nih": "http://www.nih.gov"}
     records: List[Dict[str, Any]] = []
     dropped_by_policy = 0
+    dropped_missing_geometry = 0
+    dropped_by_consensus_filter = 0
+    annotation_policy = config.annotation_policy.lower().strip()
+    if annotation_policy not in {"reader", "consensus"}:
+        raise ValueError(f"Unsupported annotation_policy: {config.annotation_policy}")
 
     for xml_path in xml_files:
         patient_id = infer_patient_id_from_text(xml_path.as_posix())
@@ -330,59 +573,80 @@ def build_manifest_from_xml(config: LIDCSplitConfig) -> pd.DataFrame:
         if not reading_sessions:
             reading_sessions = root.findall(".//readingSession")
 
+        series_annotations: List[XMLAnnotation] = []
         for reader_idx, session in enumerate(reading_sessions):
             nodules = session.findall(".//nih:unblindedReadNodule", ns)
             if not nodules:
                 nodules = session.findall(".//unblindedReadNodule")
 
             for nodule in nodules:
-                nodule_id = _xml_text(nodule, "nih:noduleID", ns) or _xml_text(nodule, "noduleID", ns)
-                chars = nodule.find("nih:characteristics", ns) or nodule.find("characteristics")
-                malignancy_text = _xml_text(chars, "nih:malignancy", ns) or _xml_text(chars, "malignancy", ns)
-                if malignancy_text is None:
+                annotation = _parse_xml_annotation(patient_id, xml_path, reader_idx, nodule, ns)
+                if annotation is None:
+                    dropped_missing_geometry += 1
                     continue
-                try:
-                    malignancy_score = float(malignancy_text)
-                except ValueError:
-                    continue
+                series_annotations.append(annotation)
 
-                label_info = score_to_binary_label(malignancy_score, config.label_policy)
+        if annotation_policy == "reader":
+            for annotation in series_annotations:
+                label_info = score_to_binary_label(annotation.malignancy_score, config.label_policy)
                 if label_info is None:
                     dropped_by_policy += 1
                     continue
                 label, class_name = label_info
-
-                roi_nodes = nodule.findall(".//nih:roi", ns) or nodule.findall(".//roi")
-                z_positions = []
-                for roi in roi_nodes:
-                    z_text = _xml_text(roi, "nih:imageZposition", ns) or _xml_text(roi, "imageZposition", ns)
-                    if z_text is None:
-                        continue
-                    try:
-                        z_positions.append(float(z_text))
-                    except ValueError:
-                        continue
-
-                derived_nodule_id = nodule_id or f"reader{reader_idx}_nodule{len(records):06d}"
-                derived_nodule_id = re.sub(r"\s+", "_", derived_nodule_id)
-                annotation_id = f"{patient_id}__reader{reader_idx}__{derived_nodule_id}"
+                annotation_id = f"{patient_id}__reader{annotation.reader_id}__{annotation.nodule_id}"
                 records.append(
                     {
                         "sample_id": annotation_id,
                         "patient_id": patient_id,
-                        "nodule_id": derived_nodule_id,
+                        "nodule_id": annotation.nodule_id,
                         "label": int(label),
                         "class_name": class_name,
-                        "malignancy_score": malignancy_score,
+                        "malignancy_score": annotation.malignancy_score,
                         "score_source": "xml_reader_annotation",
-                        "source_path": "",
+                        "source_path": str(xml_path.parent),
                         "patient_dir": str(patient_root / patient_id),
                         "metadata_row": -1,
                         "xml_path": str(xml_path),
-                        "reader_id": int(reader_idx),
-                        "z_center": float(np.mean(z_positions)) if z_positions else np.nan,
+                        "reader_id": int(annotation.reader_id),
+                        "z_center": annotation.z_center,
+                        "z_min": annotation.z_min,
+                        "z_max": annotation.z_max,
+                        "x_center": annotation.x_center,
+                        "y_center": annotation.y_center,
+                        "x_min": annotation.x_min,
+                        "x_max": annotation.x_max,
+                        "y_min": annotation.y_min,
+                        "y_max": annotation.y_max,
+                        "num_readers": 1,
+                        "annotation_count": 1,
+                        "reader_ids": json.dumps([annotation.reader_id]),
+                        "reader_nodule_ids": json.dumps([annotation.nodule_id]),
+                        "malignancy_scores": json.dumps([annotation.malignancy_score]),
                     }
                 )
+            continue
+
+        clusters = _cluster_series_annotations(
+            series_annotations,
+            xy_tolerance_px=config.xy_tolerance_px,
+            z_tolerance_mm=config.z_tolerance_mm,
+        )
+        for cluster_idx, cluster in enumerate(clusters):
+            record = _build_consensus_record(
+                cluster,
+                cluster_idx=cluster_idx,
+                label_policy=config.label_policy,
+                consensus_min_readers=config.consensus_min_readers,
+            )
+            if record is None:
+                if len({annotation.reader_id for annotation in cluster}) < config.consensus_min_readers:
+                    dropped_by_consensus_filter += 1
+                else:
+                    dropped_by_policy += 1
+                continue
+            record["patient_dir"] = str(patient_root / patient_id)
+            record["source_path"] = str(xml_path.parent)
+            records.append(record)
 
     if not records:
         raise RuntimeError(
@@ -392,9 +656,16 @@ def build_manifest_from_xml(config: LIDCSplitConfig) -> pd.DataFrame:
 
     manifest = pd.DataFrame(records)
     manifest.attrs["dropped_missing_patient"] = 0
-    manifest.attrs["dropped_missing_score"] = 0
+    manifest.attrs["dropped_missing_score"] = dropped_missing_geometry
     manifest.attrs["dropped_by_policy"] = dropped_by_policy
-    manifest.attrs["column_detection"] = {"source": "xml_fallback"}
+    manifest.attrs["column_detection"] = {
+        "source": "xml_consensus" if annotation_policy == "consensus" else "xml_reader",
+        "annotation_policy": annotation_policy,
+        "consensus_min_readers": int(config.consensus_min_readers),
+        "xy_tolerance_px": float(config.xy_tolerance_px),
+        "z_tolerance_mm": float(config.z_tolerance_mm),
+        "dropped_by_consensus_filter": int(dropped_by_consensus_filter),
+    }
     return manifest
 
 
@@ -627,6 +898,10 @@ def build_summary_json(
     return {
         "task": config.task,
         "label_policy": config.label_policy,
+        "annotation_policy": config.annotation_policy,
+        "consensus_min_readers": int(config.consensus_min_readers),
+        "xy_tolerance_px": float(config.xy_tolerance_px),
+        "z_tolerance_mm": float(config.z_tolerance_mm),
         "split_scheme": config.split_scheme,
         "n_splits": int(config.n_splits),
         "train_ratio": float(config.train_ratio),

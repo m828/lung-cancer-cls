@@ -65,24 +65,50 @@ def test_build_lidc_manifest_from_xml_fallback(tmp_path: Path):
 <LidcReadMessage xmlns="http://www.nih.gov">
   <readingSession>
     <unblindedReadNodule>
-      <noduleID>{nodule_id}</noduleID>
+      <noduleID>{nodule_id_a}</noduleID>
       <characteristics>
-        <malignancy>{score}</malignancy>
+        <malignancy>{score_a}</malignancy>
       </characteristics>
       <roi>
         <imageZposition>1.0</imageZposition>
+        <edgeMap><xCoord>10</xCoord><yCoord>10</yCoord></edgeMap>
+        <edgeMap><xCoord>14</xCoord><yCoord>10</yCoord></edgeMap>
+        <edgeMap><xCoord>14</xCoord><yCoord>14</yCoord></edgeMap>
+        <edgeMap><xCoord>10</xCoord><yCoord>14</yCoord></edgeMap>
+      </roi>
+    </unblindedReadNodule>
+  </readingSession>
+  <readingSession>
+    <unblindedReadNodule>
+      <noduleID>{nodule_id_b}</noduleID>
+      <characteristics>
+        <malignancy>{score_b}</malignancy>
+      </characteristics>
+      <roi>
+        <imageZposition>1.2</imageZposition>
+        <edgeMap><xCoord>11</xCoord><yCoord>11</yCoord></edgeMap>
+        <edgeMap><xCoord>15</xCoord><yCoord>11</yCoord></edgeMap>
+        <edgeMap><xCoord>15</xCoord><yCoord>15</yCoord></edgeMap>
+        <edgeMap><xCoord>11</xCoord><yCoord>15</yCoord></edgeMap>
       </roi>
     </unblindedReadNodule>
   </readingSession>
 </LidcReadMessage>
 """
-    xml_1.write_text(xml_template.format(nodule_id="N1", score="1"), encoding="utf-8")
-    xml_2.write_text(xml_template.format(nodule_id="N2", score="5"), encoding="utf-8")
+    xml_1.write_text(
+        xml_template.format(nodule_id_a="N1A", score_a="1", nodule_id_b="N1B", score_b="2"),
+        encoding="utf-8",
+    )
+    xml_2.write_text(
+        xml_template.format(nodule_id_a="N2A", score_a="5", nodule_id_b="N2B", score_b="4"),
+        encoding="utf-8",
+    )
 
     config = LIDCSplitConfig(
         input_root=tmp_path / "LIDC-IDRI",
         output_dir=tmp_path / "out_xml",
         metadata_source="xml",
+        annotation_policy="consensus",
         split_scheme="patient_holdout",
         train_ratio=0.5,
         val_ratio=0.25,
@@ -93,3 +119,5 @@ def test_build_lidc_manifest_from_xml_fallback(tmp_path: Path):
     assert len(manifest) == 2
     assert set(manifest["class_name"].tolist()) == {"benign", "malignant"}
     assert manifest["xml_path"].str.endswith("annot.xml").all()
+    assert set(manifest["num_readers"].tolist()) == {2}
+    assert manifest["score_source"].eq("xml_consensus").all()

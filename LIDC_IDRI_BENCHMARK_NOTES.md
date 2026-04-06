@@ -239,6 +239,7 @@ python build_lidc_idri_split_manifest.py \
 ```
 
 先固定文献常见的 `1-2 -> benign`、`4-5 -> malignant`、`drop score=3` 和 patient-wise split，再基于这份 manifest 去做结节裁剪、3D 预处理和训练。
+当前脚本默认优先生成 `consensus nodule` 级别样本；如果只有原始 XML 而没有更干净的结节级标签表，它会按 reader 标注的空间邻近关系先聚合，再做 malignancy 平均和标签折叠。
 
 ```bash
 python train.py \

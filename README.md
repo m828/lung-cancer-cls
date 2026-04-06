@@ -166,6 +166,7 @@ python build_lidc_idri_split_manifest.py \
 ```
 
 先用这条命令从原始 `LIDC-IDRI` + `metadata.csv` 生成文献常见的 `1-2 vs 4-5`、patient-wise split manifest，再基于整理好的 `3D .npy` 目录跑下面的训练命令。
+当 `metadata.csv` 里没有 malignancy 标签时，脚本会默认回退到 XML，并按 reader 标注的空间位置聚合成 `consensus nodule`，而不是把每个 reader annotation 都直接当成独立样本。
 
 ```bash
 python train.py \

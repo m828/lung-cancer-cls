@@ -91,6 +91,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nodule-col", type=str, default=None, help="Optional explicit nodule column name.")
     parser.add_argument("--malignancy-col", type=str, default=None, help="Optional explicit malignancy column name.")
     parser.add_argument("--path-col", type=str, default=None, help="Optional explicit path column name.")
+    parser.add_argument(
+        "--annotation-policy",
+        type=str,
+        choices=["consensus", "reader"],
+        default="consensus",
+        help="How XML annotations are turned into samples when metadata.csv lacks malignancy labels.",
+    )
+    parser.add_argument(
+        "--consensus-min-readers",
+        type=int,
+        default=1,
+        help="Minimum unique reader count required to keep a consensus nodule.",
+    )
+    parser.add_argument(
+        "--xy-tolerance-px",
+        type=float,
+        default=15.0,
+        help="In-plane centroid tolerance used when clustering reader annotations into a nodule.",
+    )
+    parser.add_argument(
+        "--z-tolerance-mm",
+        type=float,
+        default=3.0,
+        help="Axial overlap tolerance used when clustering reader annotations into a nodule.",
+    )
     return parser.parse_args()
 
 
@@ -117,6 +142,10 @@ def main() -> None:
         nodule_col=args.nodule_col,
         malignancy_col=args.malignancy_col,
         path_col=args.path_col,
+        annotation_policy=args.annotation_policy,
+        consensus_min_readers=args.consensus_min_readers,
+        xy_tolerance_px=args.xy_tolerance_px,
+        z_tolerance_mm=args.z_tolerance_mm,
     )
 
     patient_root = resolve_patient_root(config.input_root)
@@ -128,6 +157,10 @@ def main() -> None:
     print(f"metadata_csv:   {config.metadata_csv if config.metadata_csv is not None else '(none)'}")
     print(f"metadata_source:{config.metadata_source}")
     print(f"label_policy:   {config.label_policy}")
+    print(f"annotation_policy:{config.annotation_policy}")
+    print(f"consensus_min_readers:{config.consensus_min_readers}")
+    print(f"xy_tolerance_px:{config.xy_tolerance_px}")
+    print(f"z_tolerance_mm:{config.z_tolerance_mm}")
     print(f"split_scheme:   {config.split_scheme}")
     print(f"output_dir:     {config.output_dir}")
     print("=" * 72)

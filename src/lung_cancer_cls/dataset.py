@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable, Dict, List, Sequence, Tuple, Optional
+from typing import Any, Callable, Dict, List, Sequence, Tuple, Optional
 
 import numpy as np
 from PIL import Image
@@ -84,6 +84,52 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 def canonicalize_class_name(name: str) -> str | None:
     return ALIASES.get(name.strip().lower())
+
+
+def _load_predefined_split_rows(
+    split_manifest_csv: Path | None,
+    split_fold: int | None = None,
+) -> Dict[str, Dict[str, Any]]:
+    if split_manifest_csv is None:
+        return {}
+
+    import pandas as pd
+
+    split_df = pd.read_csv(split_manifest_csv)
+    required_columns = {"sample_id", "split"}
+    if not required_columns.issubset(split_df.columns):
+        raise RuntimeError(
+            f"Split manifest must include columns {sorted(required_columns)}, got {list(split_df.columns)}"
+        )
+
+    if "fold" in split_df.columns:
+        if split_fold is None:
+            sample_to_folds = split_df.groupby("sample_id")["fold"].nunique()
+            if (sample_to_folds > 1).any():
+                raise RuntimeError(
+                    "split_manifest.csv contains multiple folds per sample_id. "
+                    "Please pass split_fold to select one fold."
+                )
+        else:
+            split_df = split_df.loc[split_df["fold"] == split_fold].copy()
+    elif split_fold is not None:
+        raise RuntimeError("Requested split_fold but split_manifest.csv has no fold column")
+
+    key_col = "output_stem" if "output_stem" in split_df.columns else "sample_id"
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for _, row in split_df.iterrows():
+        key = str(row[key_col])
+        metadata: Dict[str, Any] = {
+            "sample_id": str(row["sample_id"]),
+            "split": str(row["split"]).lower().strip(),
+        }
+        for column in ["fold", "patient_id", "nodule_id", "class_name", "relative_path"]:
+            if column in split_df.columns and not pd.isna(row[column]):
+                metadata[column] = row[column]
+        if "patient_id" in metadata:
+            metadata["group_id"] = str(metadata["patient_id"])
+        lookup[key] = metadata
+    return lookup
 
 
 class DataGenerator(Dataset):
@@ -464,6 +510,12 @@ class LIDCIDRIDataset(BaseCTDataset):
         use_3d = bool(kwargs.get("use_3d", False))
         depth_size = int(kwargs.get("depth_size", 32))
         volume_hw = int(kwargs.get("volume_hw", 128))
+        split_manifest_csv = kwargs.get("split_manifest_csv")
+        split_fold = kwargs.get("split_fold")
+        split_lookup = _load_predefined_split_rows(
+            Path(split_manifest_csv) if split_manifest_csv is not None else None,
+            int(split_fold) if split_fold is not None else None,
+        )
 
         samples: List[Sample] = []
         for label_dir in root.iterdir():
@@ -478,10 +530,16 @@ class LIDCIDRIDataset(BaseCTDataset):
             for p in label_dir.rglob("*"):
                 if not p.is_file():
                     continue
-                metadata = None
+                metadata: Dict[str, Any] | None = None
                 rel_parent = p.relative_to(label_dir).parent
                 if rel_parent != Path("."):
                     metadata = {"relative_parent": rel_parent.as_posix()}
+                sample_key = p.name[:-7] if p.name.lower().endswith(".nii.gz") else p.stem
+                if split_lookup:
+                    split_meta = split_lookup.get(sample_key)
+                    if split_meta is None:
+                        continue
+                    metadata = {**(metadata or {}), **split_meta}
                 if use_3d:
                     if p.suffix.lower() == ".npy":
                         samples.append(Sample(image_path=p, label=label, metadata=metadata))

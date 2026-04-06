@@ -76,6 +76,8 @@ class TrainConfig:
     metadata_csv: Path | None = None
     ct_root: Path | None = None
     use_predefined_split: bool = False
+    split_manifest_csv: Path | None = None
+    split_fold: int | None = None
     use_3d_input: bool = False
     depth_size: int = 32
     volume_hw: int = 128
@@ -817,6 +819,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
 
     auto_3d_models = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny", "densenet3d", "densenet3d_121", "attention3d_cnn"}
     use_3d = config.use_3d_input or config.model in auto_3d_models
+    if config.dataset_type == DatasetType.LIDC_IDRI and config.split_manifest_csv is not None and not config.use_predefined_split:
+        print("检测到 split_manifest_csv，自动启用 use_predefined_split 以固定 fold 内 train/val/test 划分。")
+        config.use_predefined_split = True
 
     # 1. 创建数据集
     print("\n正在加载数据集...")
@@ -842,6 +847,9 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             dataset_kwargs["use_3d"] = True
             dataset_kwargs["depth_size"] = config.depth_size
             dataset_kwargs["volume_hw"] = config.volume_hw
+        if config.dataset_type == DatasetType.LIDC_IDRI and config.split_manifest_csv is not None:
+            dataset_kwargs["split_manifest_csv"] = config.split_manifest_csv
+            dataset_kwargs["split_fold"] = config.split_fold
         full_dataset = create_dataset(config.dataset_type, config.data_root, **dataset_kwargs)
         samples = full_dataset.get_samples()
     samples, class_names = remap_samples_by_class_mode(
@@ -1240,6 +1248,8 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "class_weight_strategy": config.class_weight_strategy,
             "effective_num_beta": config.effective_num_beta,
             "group_split_mode": config.group_split_mode,
+            "split_manifest_csv": str(config.split_manifest_csv) if config.split_manifest_csv else None,
+            "split_fold": config.split_fold,
             "split_mode": config.split_mode,
             "loss_name": config.loss_name,
             "mask_txt": str(config.mask_txt) if config.mask_txt else None,
@@ -1486,6 +1496,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth-size", type=int, default=32, help="3D 输入重采样深度")
     parser.add_argument("--volume-hw", type=int, default=128, help="3D 输入重采样后的平面分辨率")
 
+    parser.add_argument("--split-manifest-csv", type=str, default=None, help="Optional fixed split manifest for LIDC-IDRI consensus crops.")
+    parser.add_argument("--split-fold", type=int, default=None, help="Optional fold index used with --split-manifest-csv.")
     return parser
 
 
@@ -1542,6 +1554,8 @@ def train_main(args: argparse.Namespace) -> Dict[str, Any]:
         metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
         ct_root=Path(args.ct_root) if args.ct_root else None,
         use_predefined_split=args.use_predefined_split,
+        split_manifest_csv=Path(args.split_manifest_csv) if args.split_manifest_csv else None,
+        split_fold=args.split_fold,
         mask_txt=Path(args.mask_txt) if args.mask_txt else None,
         intranet_source=args.intranet_source,
         bundle_nm_path=Path(args.bundle_nm_path) if args.bundle_nm_path else None,

@@ -496,3 +496,73 @@ python train.py \
   --optimizer adamw --lr 3e-4 --weight-decay 1e-4 \
   --scheduler cosine
 ```
+
+## LIDC-IDRI Consensus 3D Workflow
+
+When the raw `LIDC-IDRI` download only provides XML annotations rather than a clean malignancy label table, the recommended workflow is:
+
+1. Build a patient-wise benign-vs-malignant split manifest from the raw download.
+2. Crop 3D nodule volumes from raw DICOM using the consensus manifest.
+3. Train with the exported `processed_split_manifest.csv` and a fixed `fold`.
+
+Recommended commands:
+
+```bash
+python build_lidc_idri_split_manifest.py \
+  --input-root /workspace/data-lung/LIDC-IDRI \
+  --output-dir outputs/lidc_bvm_manifest_consensus \
+  --metadata-source auto \
+  --annotation-policy consensus \
+  --consensus-min-readers 2 \
+  --xy-tolerance-px 15 \
+  --z-tolerance-mm 3 \
+  --label-policy score12_vs_score45 \
+  --split-scheme patient_kfold \
+  --n-splits 5 \
+  --val-ratio 0.1 \
+  --seed 42
+```
+
+```bash
+python prepare_lidc_idri_consensus_3d.py \
+  --input-root /workspace/data-lung/LIDC-IDRI \
+  --manifest-csv outputs/lidc_bvm_manifest_consensus/nodule_manifest.csv \
+  --split-manifest-csv outputs/lidc_bvm_manifest_consensus/split_manifest.csv \
+  --split-fold 0 \
+  --output-root /workspace/data-lung/lidc_idri_consensus_3d_fold0 \
+  --depth-size 32 \
+  --volume-hw 128 \
+  --context-scale 1.5 \
+  --min-size-xy 32 \
+  --min-size-z 8
+```
+
+```bash
+python train.py \
+  --dataset-type lidc_idri \
+  --data-root /workspace/data-lung/lidc_idri_consensus_3d_fold0 \
+  --output-dir outputs/lidc_bvm_resnet3d18_fold0 \
+  --model resnet3d18 \
+  --pretrained \
+  --use-3d-input \
+  --class-mode binary \
+  --binary-task benign_vs_malignant \
+  --use-predefined-split \
+  --split-manifest-csv /workspace/data-lung/lidc_idri_consensus_3d_fold0/processed_split_manifest.csv \
+  --split-fold 0 \
+  --split-mode train_val_test \
+  --epochs 40 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --scheduler cosine \
+  --sampling-strategy weighted \
+  --class-weight-strategy effective_num \
+  --selection-metric auroc
+```
+
+If you want to test student initialization on the same public benchmark, add:
+
+```bash
+  --init-checkpoint outputs/ct_student_kd_v1_tvt/best_model.pt \
+  --init-checkpoint-prefix ct_encoder.
+```

@@ -227,6 +227,20 @@
 先跑：
 
 ```bash
+python build_lidc_idri_split_manifest.py \
+  --input-root /workspace/data-lung/LIDC-IDRI \
+  --output-dir outputs/lidc_bvm_manifest \
+  --metadata-source auto \
+  --label-policy score12_vs_score45 \
+  --split-scheme patient_kfold \
+  --n-splits 5 \
+  --val-ratio 0.1 \
+  --seed 42
+```
+
+先固定文献常见的 `1-2 -> benign`、`4-5 -> malignant`、`drop score=3` 和 patient-wise split，再基于这份 manifest 去做结节裁剪、3D 预处理和训练。
+
+```bash
 python train.py \
   --dataset-type lidc_idri \
   --data-root <LIDC_3D_ROOT> \

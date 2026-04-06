@@ -154,6 +154,20 @@ python train.py \
 如果要更贴近 `LIDC-IDRI` 文献中的主流 benchmark，当前更推荐优先尝试：
 
 ```bash
+python build_lidc_idri_split_manifest.py \
+  --input-root /workspace/data-lung/LIDC-IDRI \
+  --output-dir outputs/lidc_bvm_manifest \
+  --metadata-source auto \
+  --label-policy score12_vs_score45 \
+  --split-scheme patient_kfold \
+  --n-splits 5 \
+  --val-ratio 0.1 \
+  --seed 42
+```
+
+先用这条命令从原始 `LIDC-IDRI` + `metadata.csv` 生成文献常见的 `1-2 vs 4-5`、patient-wise split manifest，再基于整理好的 `3D .npy` 目录跑下面的训练命令。
+
+```bash
 python train.py \
   --dataset-type lidc_idri \
   --data-root /workspace/data-lung/lidc_idri_3d_npy \

@@ -35,11 +35,30 @@ python train.py \
 ```bash
 python prepare_intranet_ct_npy.py \
   --source-csv <OLD_MULTI_MODAL_CSV> \
+  --source-data-root /home/apulis-dev/userdata/Data \
   --output-root <NPY_OUTPUT_ROOT> \
   --manifest-out outputs/intranet_rebuild_manifest_plan.csv \
   --qc-csv outputs/intranet_rebuild_qc.csv \
   --summary-json outputs/intranet_rebuild_summary.json \
   --scan-only
+```
+
+说明：如果旧 CSV 里的 `CT dicom路径` 仍是 `Z:\CT数据 20251120\...`，上传到服务器后不要直接使用旧路径。加上：
+
+```bash
+  --source-data-root /home/apulis-dev/userdata/Data
+```
+
+工具会按病例目录名把旧路径重建到：
+
+- `/home/apulis-dev/userdata/Data/健康对照_原始/健康对照/<病例目录>`
+- `/home/apulis-dev/userdata/Data/良性结节+肺癌_原始/良性结节+肺癌/<病例目录>`
+
+如果实际目录名或层级和上面不一致，可以用显式映射：
+
+```bash
+  --source-path-map "Z:\CT数据 20251120\健康对照_find1mm_fix1124\肺窗1mm标准=/home/apulis-dev/userdata/Data/健康对照_原始/健康对照" \
+  --source-path-map "Z:\CT数据 20251120\良性结节+肺癌_find1mm_fix1124\肺窗近1mm=/home/apulis-dev/userdata/Data/良性结节+肺癌_原始/良性结节+肺癌"
 ```
 
 重点先看：
@@ -71,6 +90,7 @@ python prepare_intranet_ct_npy.py \
 ```bash
 python prepare_intranet_ct_npy.py \
   --source-csv <OLD_MULTI_MODAL_CSV> \
+  --source-data-root /home/apulis-dev/userdata/Data \
   --output-root <NPY_OUTPUT_ROOT> \
   --manifest-out outputs/intranet_rebuild_manifest.csv \
   --qc-csv outputs/intranet_rebuild_qc.csv \
@@ -117,7 +137,7 @@ python train.py \
 
 ```bash
 python prepare_intranet_ct_npy.py \
-  --input-root 良性结节=<BENIGN_500_DICOM_ROOT> \
+  --input-root 良性结节=/home/apulis-dev/userdata/Data/良性患者500例 \
   --root-split-mode train_val_test \
   --output-root <BENIGN_NPY_OUTPUT_ROOT> \
   --manifest-out outputs/benign500_manifest_plan.csv \
@@ -130,7 +150,7 @@ python prepare_intranet_ct_npy.py \
 
 ```bash
 python prepare_intranet_ct_npy.py \
-  --input-root 良性结节=<BENIGN_500_DICOM_ROOT> \
+  --input-root 良性结节=/home/apulis-dev/userdata/Data/良性患者500例 \
   --root-split-mode train_val_test \
   --output-root <BENIGN_NPY_OUTPUT_ROOT> \
   --manifest-out outputs/benign500_manifest.csv \
@@ -143,6 +163,7 @@ python prepare_intranet_ct_npy.py \
 
 - `--input-root 良性结节=...` 会把该目录下的每个一级子目录当作一个病例。
 - 如果某个病例目录下有多个 DICOM series，默认选择最像肺部诊断序列的一条：优先 `lung/chest/肺/胸`、薄层、层数更多、spacing 更小。
+- 如果 SimpleITK 目录级检测提示 `No Series were found`，工具会自动退回逐文件读取 DICOM header 并按 `SeriesInstanceUID` 分组；默认会压掉 SimpleITK/GDCM 的原始 warning 噪声，具体是否扫到、是否合格以 `benign500_qc.csv` 和 `benign500_summary_skipped_cases.csv` 为准。需要调试原始 warning 时再加 `--show-sitk-warnings`。
 - `--root-split-mode train_val_test` 会给新增良性病例生成 `train/val/test` 划分；如果后续你决定全量重新随机划分，也可以设成 `blank`，训练时不要加 `--use-predefined-split`。
 
 ## 4. 合并旧数据和新增良性

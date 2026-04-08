@@ -93,6 +93,33 @@ def test_build_case_inputs_from_source_csv(monkeypatch):
     assert cases[0].source == "csv"
 
 
+def test_source_data_root_rebases_old_csv_path_by_label():
+    cfg = _cfg(Path("."), source_data_root=Path("/home/apulis-dev/userdata/Data"))
+    rebased = preprocess._rebase_source_dicom_root(
+        r"Z:\CT数据 20251120\健康对照_find1mm_fix1124\肺窗1mm标准\DJ20211120B0452",
+        "健康对照",
+        cfg,
+    )
+
+    assert rebased == Path("/home/apulis-dev/userdata/Data/健康对照_原始/健康对照/DJ20211120B0452")
+
+
+def test_source_path_map_replaces_windows_prefix():
+    cfg = _cfg(
+        Path("."),
+        source_path_maps=(
+            r"Z:\CT数据 20251120\良性结节+肺癌_find1mm_fix1124\肺窗近1mm=/userdata/Data/良性结节+肺癌_原始/良性结节+肺癌",
+        ),
+    )
+    rebased = preprocess._rebase_source_dicom_root(
+        r"Z:\CT数据 20251120\良性结节+肺癌_find1mm_fix1124\肺窗近1mm\DJ20210315B0196",
+        "肺癌",
+        cfg,
+    )
+
+    assert rebased == Path("/userdata/Data/良性结节+肺癌_原始/良性结节+肺癌/DJ20210315B0196")
+
+
 def test_root_split_assignment_train_val_test():
     cases = [
         CaseInput(

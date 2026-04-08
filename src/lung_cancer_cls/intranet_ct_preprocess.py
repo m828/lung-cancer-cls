@@ -42,6 +42,8 @@ class IntranetCTPreprocessConfig:
     summary_json: Path
     source_csv: Path | None = None
     input_roots: Tuple[str, ...] = ()
+    source_data_root: Path | None = None
+    source_path_maps: Tuple[str, ...] = ()
     dicom_path_col: str = "CT dicom路径"
     npy_path_col: str = "CT_numpy路径"
     npy_cloud_path_col: str = "CT_numpy_cloud路径"
@@ -65,6 +67,7 @@ class IntranetCTPreprocessConfig:
     cloud_prefix: str = ""
     limit: int | None = None
     overwrite: bool = False
+    suppress_sitk_warnings: bool = True
 
 
 @dataclass
@@ -103,6 +106,7 @@ class SeriesRecord:
     scanner_model: str
     eligible: bool
     exclude_reasons: str
+    dicom_files: Tuple[Path, ...] = ()
 
 
 def sanitize_filename(value: str, fallback: str = "case") -> str:
@@ -144,12 +148,113 @@ def _parse_input_root_spec(spec: str) -> Tuple[str, Path]:
     return label, Path(raw_path.strip())
 
 
-def _has_direct_dicom_series(path: Path) -> bool:
+def _split_any_path(path_text: str) -> List[str]:
+    return [part for part in re.split(r"[\\/]+", str(path_text).strip()) if part]
+
+
+def _path_leaf(path_text: str) -> str:
+    parts = _split_any_path(path_text)
+    if not parts:
+        return ""
+    leaf = parts[-1]
+    return "" if re.fullmatch(r"[A-Za-z]:", leaf) else leaf
+
+
+def _path_text_startswith(path_text: str, prefix: str) -> Tuple[bool, str]:
+    path_norm = str(path_text).replace("\\", "/").strip()
+    prefix_norm = str(prefix).replace("\\", "/").strip().rstrip("/")
+    if not prefix_norm:
+        return False, ""
+    path_lower = path_norm.lower()
+    prefix_lower = prefix_norm.lower()
+    if path_lower == prefix_lower:
+        return True, ""
+    if path_lower.startswith(prefix_lower + "/"):
+        return True, path_norm[len(prefix_norm) :].lstrip("/")
+    return False, ""
+
+
+def _apply_source_path_maps(dicom_path_text: str, source_path_maps: Sequence[str]) -> Path | None:
+    for spec in source_path_maps:
+        if "=" not in spec:
+            raise ValueError(f"Expected OLD=NEW for --source-path-map, got: {spec}")
+        old_prefix, new_prefix = spec.split("=", 1)
+        matched, relative_suffix = _path_text_startswith(dicom_path_text, old_prefix)
+        if not matched:
+            continue
+        new_root = Path(new_prefix.strip())
+        if not relative_suffix:
+            return new_root
+        return new_root.joinpath(*_split_any_path(relative_suffix))
+    return None
+
+
+def _default_source_data_candidates(
+    dicom_path_text: str,
+    label_name: str,
+    source_data_root: Path,
+) -> List[Path]:
+    case_leaf = _path_leaf(dicom_path_text)
+    if not case_leaf:
+        return []
+
+    label_and_path = f"{label_name} {dicom_path_text}"
+    candidate_subdirs: List[Tuple[str, str]] = []
+    if label_name in {"健康对照", "normal"} or "健康对照" in label_and_path:
+        candidate_subdirs.append(("健康对照_原始", "健康对照"))
+    if label_name in {"良性结节", "肺癌", "benign", "malignant"} or any(
+        token in label_and_path for token in ["良性结节", "肺癌"]
+    ):
+        candidate_subdirs.append(("良性结节+肺癌_原始", "良性结节+肺癌"))
+
+    # Fallbacks help when the CSV label is normalized but the old path text is noisy.
+    for pair in [
+        ("健康对照_原始", "健康对照"),
+        ("良性结节+肺癌_原始", "良性结节+肺癌"),
+    ]:
+        if pair not in candidate_subdirs:
+            candidate_subdirs.append(pair)
+
+    candidates = [source_data_root / first / second / case_leaf for first, second in candidate_subdirs]
+    candidates.append(source_data_root / case_leaf)
+    return candidates
+
+
+def _rebase_source_dicom_root(
+    dicom_path_text: str,
+    label_name: str,
+    config: IntranetCTPreprocessConfig,
+) -> Path:
+    mapped = _apply_source_path_maps(dicom_path_text, config.source_path_maps)
+    if mapped is not None:
+        return mapped
+
+    original = Path(dicom_path_text)
+    if original.exists():
+        return original
+
+    if config.source_data_root is not None:
+        candidates = _default_source_data_candidates(dicom_path_text, label_name, config.source_data_root)
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        if candidates:
+            return candidates[0]
+
+    return original
+
+
+def _has_direct_dicom_series(path: Path, suppress_warnings: bool = True) -> bool:
     if not path.is_dir():
         return False
     try:
         import SimpleITK as sitk
 
+        if suppress_warnings:
+            try:
+                sitk.ProcessObject_SetGlobalWarningDisplay(False)
+            except Exception:
+                pass
         return bool(sitk.ImageSeriesReader.GetGDCMSeriesIDs(str(path)) or [])
     except Exception:
         return False
@@ -179,7 +284,10 @@ def build_case_inputs(config: IntranetCTPreprocessConfig) -> List[CaseInput]:
             dicom_path_text = _safe_text(row.get(config.dicom_path_col))
             if not dicom_path_text:
                 continue
-            dicom_root = Path(dicom_path_text)
+            dicom_root = _rebase_source_dicom_root(dicom_path_text, label_name, config)
+            row_data = {str(k): row[k] for k in row.index}
+            if str(dicom_root) != dicom_path_text:
+                row_data.setdefault("preprocess_original_dicom_path", dicom_path_text)
             cases.append(
                 CaseInput(
                     case_id=_case_id_from_row(row, config.sample_id_col, dicom_root, row_idx),
@@ -187,7 +295,7 @@ def build_case_inputs(config: IntranetCTPreprocessConfig) -> List[CaseInput]:
                     label_name=label_name,
                     split=_normalize_split(row.get(config.split_col)) if config.split_col in row.index else "",
                     source="csv",
-                    row_data={str(k): row[k] for k in row.index},
+                    row_data=row_data,
                 )
             )
 
@@ -195,7 +303,7 @@ def build_case_inputs(config: IntranetCTPreprocessConfig) -> List[CaseInput]:
     for spec in config.input_roots:
         label_name, input_root = _parse_input_root_spec(spec)
         if input_root.is_dir():
-            if _has_direct_dicom_series(input_root):
+            if _has_direct_dicom_series(input_root, suppress_warnings=config.suppress_sitk_warnings):
                 candidate_dirs = [input_root]
             else:
                 children = [path for path in sorted(input_root.iterdir()) if path.is_dir()]
@@ -277,6 +385,211 @@ def _get_reader_metadata(reader: Any, idx: int, tag: str) -> str:
     return ""
 
 
+def _parse_float_list(value: str) -> List[float]:
+    values: List[float] = []
+    for item in re.split(r"[\\, ]+", str(value).strip()):
+        if not item:
+            continue
+        parsed = _safe_float(item)
+        if parsed is None:
+            return []
+        values.append(parsed)
+    return values
+
+
+def _iter_candidate_dicom_files(root: Path) -> Iterable[Path]:
+    if root.is_file():
+        yield root
+        return
+    if not root.is_dir():
+        return
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.upper() == "DICOMDIR":
+            continue
+        yield path
+
+
+def _read_dicom_file_header(path: Path) -> Dict[str, Any] | None:
+    import SimpleITK as sitk
+
+    reader = sitk.ImageFileReader()
+    reader.SetFileName(str(path))
+    reader.LoadPrivateTagsOn()
+    try:
+        reader.ReadImageInformation()
+    except Exception:
+        return None
+
+    def meta(tag: str) -> str:
+        try:
+            if reader.HasMetaDataKey(tag):
+                return reader.GetMetaData(tag).strip()
+        except Exception:
+            return ""
+        return ""
+
+    try:
+        size = tuple(int(v) for v in reader.GetSize())
+    except Exception:
+        size = ()
+    try:
+        spacing = tuple(float(v) for v in reader.GetSpacing())
+    except Exception:
+        spacing = ()
+
+    return {
+        "path": path,
+        "size": size,
+        "spacing": spacing,
+        "modality": meta("0008|0060"),
+        "body_part": meta("0018|0015"),
+        "series_description": meta("0008|103e"),
+        "protocol_name": meta("0018|1030"),
+        "slice_thickness": _safe_float(meta("0018|0050")),
+        "patient_id": meta("0010|0020"),
+        "study_instance_uid": meta("0020|000d"),
+        "series_instance_uid": meta("0020|000e"),
+        "study_date": meta("0008|0020"),
+        "manufacturer": meta("0008|0070"),
+        "scanner_model": meta("0008|1090"),
+        "instance_number": _safe_float(meta("0020|0013")),
+        "slice_location": _safe_float(meta("0020|1041")),
+        "image_position_patient": _parse_float_list(meta("0020|0032")),
+    }
+
+
+def _file_header_sort_key(header: Dict[str, Any]) -> Tuple[int, float, float, str]:
+    position = header.get("image_position_patient") or []
+    instance_number = header.get("instance_number")
+    instance = float(instance_number) if instance_number is not None else 0.0
+    if len(position) >= 3:
+        return (0, float(position[2]), instance, str(header["path"]))
+    slice_location = header.get("slice_location")
+    if slice_location is not None:
+        return (1, float(slice_location), instance, str(header["path"]))
+    if instance_number is not None:
+        return (2, instance, instance, str(header["path"]))
+    return (3, 0.0, 0.0, str(header["path"]))
+
+
+def _median_z_spacing_from_headers(headers: Sequence[Dict[str, Any]]) -> float | None:
+    if len(headers) < 2:
+        return None
+
+    sorted_headers = sorted(headers, key=_file_header_sort_key)
+    positions = [header.get("image_position_patient") or [] for header in sorted_headers]
+    if all(len(position) >= 3 for position in positions):
+        distances = []
+        for prev, curr in zip(positions, positions[1:]):
+            distance = float(np.linalg.norm(np.asarray(curr[:3], dtype=np.float64) - np.asarray(prev[:3], dtype=np.float64)))
+            if distance > 1e-6:
+                distances.append(distance)
+        if distances:
+            return float(np.median(distances))
+
+    locations = [header.get("slice_location") for header in sorted_headers]
+    if all(location is not None for location in locations):
+        deltas = [
+            abs(float(curr) - float(prev))
+            for prev, curr in zip(locations, locations[1:])
+            if abs(float(curr) - float(prev)) > 1e-6
+        ]
+        if deltas:
+            return float(np.median(deltas))
+    return None
+
+
+def _metadata_for_file_group(
+    case: CaseInput,
+    headers: Sequence[Dict[str, Any]],
+    series_id: str,
+    config: IntranetCTPreprocessConfig,
+) -> SeriesRecord:
+    sorted_headers = sorted(headers, key=_file_header_sort_key)
+    first = sorted_headers[0]
+    files = tuple(header["path"] for header in sorted_headers)
+    parents = {path.parent for path in files}
+    series_dir = files[0].parent if len(parents) == 1 else case.dicom_root
+
+    size = first.get("size") or ()
+    spacing = first.get("spacing") or ()
+    rows = int(size[1]) if len(size) >= 2 else 0
+    columns = int(size[0]) if len(size) >= 1 else 0
+    spacing_x = float(spacing[0]) if len(spacing) >= 1 else None
+    spacing_y = float(spacing[1]) if len(spacing) >= 2 else None
+    spacing_z = _median_z_spacing_from_headers(sorted_headers)
+    slice_thickness = first.get("slice_thickness")
+
+    eligible, reasons = assess_series_quality(
+        modality=first.get("modality") or "",
+        rows=rows,
+        columns=columns,
+        num_slices=len(files),
+        spacing_x=spacing_x,
+        spacing_y=spacing_y,
+        spacing_z=spacing_z,
+        slice_thickness=slice_thickness,
+        series_description=first.get("series_description") or "",
+        protocol_name=first.get("protocol_name") or "",
+        config=config,
+    )
+
+    series_uid = first.get("series_instance_uid") or series_id
+    return SeriesRecord(
+        case_id=case.case_id,
+        label_name=case.label_name,
+        source=case.source,
+        series_dir=series_dir,
+        series_id=series_id,
+        num_slices=len(files),
+        rows=rows,
+        columns=columns,
+        spacing_x=spacing_x,
+        spacing_y=spacing_y,
+        spacing_z=spacing_z,
+        slice_thickness=slice_thickness,
+        modality=first.get("modality") or "",
+        body_part=first.get("body_part") or "",
+        series_description=first.get("series_description") or "",
+        protocol_name=first.get("protocol_name") or "",
+        patient_id=first.get("patient_id") or "",
+        study_instance_uid=first.get("study_instance_uid") or "",
+        series_instance_uid=series_uid,
+        study_date=first.get("study_date") or "",
+        manufacturer=first.get("manufacturer") or "",
+        scanner_model=first.get("scanner_model") or "",
+        eligible=eligible,
+        exclude_reasons=";".join(reasons),
+        dicom_files=files,
+    )
+
+
+def _metadata_from_dicom_files(case: CaseInput, config: IntranetCTPreprocessConfig) -> List[SeriesRecord]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for path in _iter_candidate_dicom_files(case.dicom_root):
+        header = _read_dicom_file_header(path)
+        if header is None:
+            continue
+        series_uid = header.get("series_instance_uid") or ""
+        study_uid = header.get("study_instance_uid") or ""
+        if series_uid:
+            group_key = f"{study_uid}::{series_uid}"
+        else:
+            fallback_raw = f"{path.parent.as_posix()}::{header.get('modality') or ''}"
+            group_key = "file_group_" + hashlib.sha1(fallback_raw.encode("utf-8")).hexdigest()[:12]
+        grouped.setdefault(group_key, []).append(header)
+
+    records: List[SeriesRecord] = []
+    for group_key, headers in grouped.items():
+        try:
+            records.append(_metadata_for_file_group(case, headers, group_key, config))
+        except Exception:
+            continue
+    return records
+
+
 def _metadata_for_series(case: CaseInput, series_dir: Path, series_id: str, config: IntranetCTPreprocessConfig) -> SeriesRecord:
     import SimpleITK as sitk
 
@@ -348,6 +661,7 @@ def _metadata_for_series(case: CaseInput, series_dir: Path, series_id: str, conf
         scanner_model=scanner_model,
         eligible=eligible,
         exclude_reasons=";".join(reasons),
+        dicom_files=tuple(Path(name) for name in filenames),
     )
 
 
@@ -394,6 +708,12 @@ def discover_case_series(case: CaseInput, config: IntranetCTPreprocessConfig) ->
 
     if not case.dicom_root.exists():
         return []
+    if config.suppress_sitk_warnings:
+        try:
+            sitk.ProcessObject_SetGlobalWarningDisplay(False)
+        except Exception:
+            pass
+
     records: List[SeriesRecord] = []
     for series_dir in _iter_dirs(case.dicom_root):
         try:
@@ -405,7 +725,9 @@ def discover_case_series(case: CaseInput, config: IntranetCTPreprocessConfig) ->
                 records.append(_metadata_for_series(case, series_dir, series_id, config))
             except Exception:
                 continue
-    return records
+    if records:
+        return records
+    return _metadata_from_dicom_files(case, config)
 
 
 def _series_preference(record: SeriesRecord) -> Tuple[int, int, float, float, int]:
@@ -439,11 +761,18 @@ def select_series(records: Sequence[SeriesRecord], series_mode: str = "best") ->
     return [max(candidates, key=_series_preference)]
 
 
-def load_dicom_series_volume(series_dir: Path, series_id: str) -> np.ndarray:
+def load_dicom_series_volume(
+    series_dir: Path,
+    series_id: str,
+    dicom_files: Sequence[Path] | None = None,
+) -> np.ndarray:
     import SimpleITK as sitk
 
     reader = sitk.ImageSeriesReader()
-    filenames = reader.GetGDCMSeriesFileNames(str(series_dir), series_id)
+    if dicom_files:
+        filenames = [str(path) for path in dicom_files]
+    else:
+        filenames = reader.GetGDCMSeriesFileNames(str(series_dir), series_id)
     if not filenames:
         raise RuntimeError(f"No DICOM files found for series_id={series_id} under {series_dir}")
     reader.SetFileNames(filenames)
@@ -509,8 +838,12 @@ def _cloud_path(relative_path: str, cloud_prefix: str) -> str:
 
 def _series_record_to_qc_row(case: CaseInput, record: SeriesRecord, selected: bool) -> Dict[str, Any]:
     row = asdict(record)
+    row.pop("dicom_files", None)
     row["series_dir"] = str(record.series_dir)
     row["dicom_root"] = str(case.dicom_root)
+    row["dicom_file_count"] = len(record.dicom_files) if record.dicom_files else record.num_slices
+    row["dicom_first_file"] = str(record.dicom_files[0]) if record.dicom_files else ""
+    row["dicom_last_file"] = str(record.dicom_files[-1]) if record.dicom_files else ""
     row["case_split"] = case.split
     row["selected"] = bool(selected)
     return row
@@ -600,7 +933,7 @@ def process_intranet_ct(config: IntranetCTPreprocessConfig) -> Dict[str, Any]:
             if not config.scan_only:
                 if out_path.exists() and not config.overwrite:
                     raise FileExistsError(f"Output exists. Use --overwrite to replace: {out_path}")
-                volume = load_dicom_series_volume(record.series_dir, record.series_id)
+                volume = load_dicom_series_volume(record.series_dir, record.series_id, record.dicom_files)
                 processed = preprocess_volume(
                     volume,
                     target_depth=config.target_depth,
@@ -672,6 +1005,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional DICOM case root in LABEL=PATH form, e.g. 良性结节=Z:\\良性患者500例. Can be repeated.",
     )
+    parser.add_argument(
+        "--source-data-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root containing uploaded raw CT folders such as 健康对照_原始/健康对照 and "
+            "良性结节+肺癌_原始/良性结节+肺癌. When set, old CSV DICOM paths are rebuilt by case folder name."
+        ),
+    )
+    parser.add_argument(
+        "--source-path-map",
+        action="append",
+        default=[],
+        help=(
+            "Explicit old-to-new DICOM path prefix mapping in OLD=NEW form. Can be repeated, e.g. "
+            "Z:\\CT数据 20251120\\健康对照_find1mm_fix1124\\肺窗1mm标准=/userdata/Data/健康对照_原始/健康对照"
+        ),
+    )
     parser.add_argument("--dicom-path-col", type=str, default="CT dicom路径")
     parser.add_argument("--npy-path-col", type=str, default="CT_numpy路径")
     parser.add_argument("--npy-cloud-path-col", type=str, default="CT_numpy_cloud路径")
@@ -695,6 +1046,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=None, help="Optional debug limit on input cases.")
     parser.add_argument("--scan-only", action="store_true", help="Only write QC/manifest plan; do not save .npy files.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing generated .npy files.")
+    parser.add_argument(
+        "--show-sitk-warnings",
+        action="store_true",
+        help="Show raw SimpleITK/GDCM C++ warnings. By default these are suppressed and QC CSV records scan results.",
+    )
     return parser
 
 
@@ -707,6 +1063,8 @@ def parse_args() -> IntranetCTPreprocessConfig:
         summary_json=args.summary_json,
         source_csv=args.source_csv,
         input_roots=tuple(args.input_root or ()),
+        source_data_root=args.source_data_root,
+        source_path_maps=tuple(args.source_path_map or ()),
         dicom_path_col=args.dicom_path_col,
         npy_path_col=args.npy_path_col,
         npy_cloud_path_col=args.npy_cloud_path_col,
@@ -730,6 +1088,7 @@ def parse_args() -> IntranetCTPreprocessConfig:
         cloud_prefix=args.cloud_prefix,
         limit=args.limit,
         overwrite=args.overwrite,
+        suppress_sitk_warnings=not args.show_sitk_warnings,
     )
 
 

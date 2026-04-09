@@ -33,6 +33,8 @@ LOCALIZER_TOKENS = (
     "dose",
 )
 
+_SURROGATE_PATTERN = re.compile(r"[\ud800-\udfff]")
+
 
 @dataclass
 class IntranetCTPreprocessConfig:
@@ -879,6 +881,26 @@ def _manifest_row(case: CaseInput, record: SeriesRecord, out_path: Path, config:
     return row
 
 
+def _sanitize_csv_text(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    if not _SURROGATE_PATTERN.search(value):
+        return value
+    return _SURROGATE_PATTERN.sub("\uFFFD", value)
+
+
+def _sanitize_dataframe_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    object_columns = df.select_dtypes(include=["object"]).columns
+    if len(object_columns) == 0:
+        return df
+    sanitized = df.copy()
+    for column in object_columns:
+        sanitized[column] = sanitized[column].map(_sanitize_csv_text)
+    return sanitized
+
+
 def process_intranet_ct(config: IntranetCTPreprocessConfig) -> Dict[str, Any]:
     cases = build_case_inputs(config)
     if not cases:
@@ -948,6 +970,10 @@ def process_intranet_ct(config: IntranetCTPreprocessConfig) -> Dict[str, Any]:
     qc_df = pd.DataFrame(qc_rows)
     manifest_df = pd.DataFrame(manifest_rows)
     skipped_df = pd.DataFrame(skipped_cases)
+
+    qc_df = _sanitize_dataframe_for_csv(qc_df)
+    manifest_df = _sanitize_dataframe_for_csv(manifest_df)
+    skipped_df = _sanitize_dataframe_for_csv(skipped_df)
 
     qc_df.to_csv(config.qc_csv, index=False, encoding="utf-8-sig")
     manifest_df.to_csv(config.manifest_out, index=False, encoding="utf-8-sig")

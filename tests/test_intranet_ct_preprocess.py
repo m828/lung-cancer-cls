@@ -2,6 +2,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from lung_cancer_cls import intranet_ct_preprocess as preprocess
 from lung_cancer_cls.intranet_ct_preprocess import (
@@ -63,6 +64,24 @@ def test_preprocess_volume_resizes_and_windows_hu():
     assert out.dtype == np.float32
     assert float(out.min()) >= 0.0
     assert float(out.max()) <= 1.0
+
+
+def test_preprocess_volume_accepts_identical_multichannel_input():
+    base = np.linspace(-1200, 600, num=4 * 6 * 8, dtype=np.float32).reshape(4, 6, 8)
+    volume = np.repeat(base[..., None], repeats=3, axis=-1)
+
+    out = preprocess_volume(volume, target_depth=3, target_hw=5, hu_min=-1000, hu_max=400)
+
+    assert out.shape == (3, 5, 5)
+    assert out.dtype == np.float32
+
+
+def test_preprocess_volume_rejects_non_scalar_multichannel_input():
+    base = np.zeros((4, 6, 8), dtype=np.float32)
+    volume = np.stack([base, base + 10, base + 20], axis=-1)
+
+    with pytest.raises(ValueError, match="multi-channel"):
+        preprocess_volume(volume, target_depth=3, target_hw=5, hu_min=-1000, hu_max=400)
 
 
 def test_build_case_inputs_from_source_csv(monkeypatch):
@@ -160,3 +179,76 @@ def test_select_series_all_returns_only_eligible():
     ineligible = _record("B", eligible=False, num_slices=100, z=1.0)
 
     assert select_series([eligible, ineligible], series_mode="all") == [eligible]
+
+
+def test_process_intranet_ct_skips_failed_conversion_and_continues(monkeypatch):
+    case = CaseInput(
+        case_id="bad_case",
+        dicom_root=Path("bad_case"),
+        label_name="benign",
+        split="train",
+        source="root",
+        row_data=None,
+    )
+    record = SeriesRecord(
+        case_id="bad_case",
+        label_name="benign",
+        source="root",
+        series_dir=Path("bad_case"),
+        series_id="series_bad",
+        num_slices=39,
+        rows=512,
+        columns=512,
+        spacing_x=0.8,
+        spacing_y=0.8,
+        spacing_z=1.0,
+        slice_thickness=1.0,
+        modality="CT",
+        body_part="CHEST",
+        series_description="CHEST",
+        protocol_name="",
+        patient_id="bad_case",
+        study_instance_uid="study",
+        series_instance_uid="uid_bad",
+        study_date="",
+        manufacturer="",
+        scanner_model="",
+        eligible=True,
+        exclude_reasons="",
+    )
+
+    monkeypatch.setattr(preprocess, "build_case_inputs", lambda config: [case])
+    monkeypatch.setattr(preprocess, "discover_case_series", lambda *_args, **_kwargs: [record])
+    monkeypatch.setattr(
+        preprocess,
+        "load_dicom_series_volume",
+        lambda *_args, **_kwargs: np.stack(
+            [
+                np.zeros((39, 16, 16), dtype=np.float32),
+                np.ones((39, 16, 16), dtype=np.float32),
+                np.full((39, 16, 16), 2.0, dtype=np.float32),
+            ],
+            axis=-1,
+        ),
+    )
+    writes: dict[str, pd.DataFrame] = {}
+    summaries: dict[str, str] = {}
+
+    def fake_to_csv(self, path, index=False, encoding=None):
+        writes[str(path)] = self.copy()
+
+    def fake_write_text(self, text, encoding=None):
+        summaries[str(self)] = text
+        return len(text)
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", fake_to_csv, raising=False)
+    monkeypatch.setattr(Path, "mkdir", lambda self, parents=False, exist_ok=False: None)
+    monkeypatch.setattr(Path, "write_text", fake_write_text, raising=False)
+
+    summary = preprocess.process_intranet_ct(_cfg(Path("."), scan_only=False, overwrite=True))
+    skipped_df = writes["summary_skipped_cases.csv"]
+
+    assert summary["num_qc_series"] == 1
+    assert summary["num_manifest_rows"] == 0
+    assert summary["num_skipped_cases"] == 1
+    assert "conversion_failed:ValueError:Unsupported multi-channel DICOM volume shape" in skipped_df.loc[0, "reason"]

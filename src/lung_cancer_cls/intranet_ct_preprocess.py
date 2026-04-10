@@ -791,6 +791,18 @@ def preprocess_volume(
 ) -> np.ndarray:
     if volume.ndim == 2:
         volume = volume[None, ...]
+    elif volume.ndim == 4 and volume.shape[-1] >= 1:
+        if volume.shape[-1] == 1:
+            volume = volume[..., 0]
+        else:
+            first_channel = volume[..., 0]
+            if np.allclose(volume, first_channel[..., None]):
+                volume = first_channel
+            else:
+                raise ValueError(
+                    "Unsupported multi-channel DICOM volume shape "
+                    f"{volume.shape}; expected scalar CT voxels"
+                )
     elif volume.ndim != 3:
         raise ValueError(f"Unsupported DICOM volume shape: {volume.shape}")
 
@@ -955,15 +967,35 @@ def process_intranet_ct(config: IntranetCTPreprocessConfig) -> Dict[str, Any]:
             if not config.scan_only:
                 if out_path.exists() and not config.overwrite:
                     raise FileExistsError(f"Output exists. Use --overwrite to replace: {out_path}")
-                volume = load_dicom_series_volume(record.series_dir, record.series_id, record.dicom_files)
-                processed = preprocess_volume(
-                    volume,
-                    target_depth=config.target_depth,
-                    target_hw=config.target_hw,
-                    hu_min=config.hu_min,
-                    hu_max=config.hu_max,
-                )
-                np.save(out_path, processed)
+                try:
+                    volume = load_dicom_series_volume(record.series_dir, record.series_id, record.dicom_files)
+                    processed = preprocess_volume(
+                        volume,
+                        target_depth=config.target_depth,
+                        target_hw=config.target_hw,
+                        hu_min=config.hu_min,
+                        hu_max=config.hu_max,
+                    )
+                    np.save(out_path, processed)
+                except Exception as exc:
+                    try:
+                        if out_path.exists():
+                            out_path.unlink()
+                    except Exception:
+                        pass
+                    reason = f"conversion_failed:{type(exc).__name__}:{str(exc)}"
+                    skipped_cases.append(
+                        {
+                            "case_id": case.case_id,
+                            "dicom_root": str(case.dicom_root),
+                            "label_name": case.label_name,
+                            "series_dir": str(record.series_dir),
+                            "series_id": record.series_id,
+                            "reason": reason,
+                        }
+                    )
+                    print(f"[warn] Skipped {case.case_id} {record.series_id}: {reason}")
+                    continue
             manifest_rows.append(_manifest_row(case, record, out_path, config))
             converted += 1
 

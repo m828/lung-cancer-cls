@@ -67,6 +67,12 @@ python prepare_intranet_ct_npy.py \
 - `intranet_rebuild_summary.json`
 - `intranet_rebuild_summary_skipped_cases.csv`
 
+说明：
+
+- 如果你用的是同一份混合 `source_csv`，里面同时包含健康、良性、恶性三类，那么一次运行就会把这三类都一起扫描出来。
+- 即使原始 DICOM 实际存放在不同目录，只要 `source_csv` 里有这些行，并且能通过 `--source-data-root` 或 `--source-path-map` 重定位到对应目录，结果仍然会是三类一起进入同一个 QC / manifest。
+- 如果你想分开跑，不能只换原始目录位置；要么拆成不同的 CSV 分别运行，要么改用 `--input-root normal=... --input-root benign=... --input-root malignant=...` 只指定某一类目录。
+
 默认筛选条件：
 
 - `min_slices >= 32`
@@ -105,6 +111,8 @@ python prepare_intranet_ct_npy.py \
 - `CT_numpy_cloud路径`
 - `样本类型`
 - `CT_train_val_split`
+
+转换时如果遇到极少数“读出来不是普通 3D 灰度 CT”的异常序列，例如多通道 `RGB` / `secondary capture` 风格的 DICOM，工具现在会把该病例写入 `*_skipped_cases.csv`，并以 `conversion_failed:...` 记录原因，而不是让整批任务中断。
 
 训练命令示例：
 
@@ -165,6 +173,42 @@ python prepare_intranet_ct_npy.py \
 - 如果某个病例目录下有多个 DICOM series，默认选择最像肺部诊断序列的一条：优先 `lung/chest/肺/胸`、薄层、层数更多、spacing 更小。
 - 如果 SimpleITK 目录级检测提示 `No Series were found`，工具会自动退回逐文件读取 DICOM header 并按 `SeriesInstanceUID` 分组；默认会压掉 SimpleITK/GDCM 的原始 warning 噪声，具体是否扫到、是否合格以 `benign500_qc.csv` 和 `benign500_summary_skipped_cases.csv` 为准。需要调试原始 warning 时再加 `--show-sitk-warnings`。
 - `--root-split-mode train_val_test` 会给新增良性病例生成 `train/val/test` 划分；如果后续你决定全量重新随机划分，也可以设成 `blank`，训练时不要加 `--use-predefined-split`。
+
+如果你打算先转换、后续再人工复核，推荐把 `5mm` 边缘样本单独标记，而不是直接删文件：
+
+```bash
+python prepare_intranet_ct_review_flags.py \
+  --manifest-csv outputs/benign500_manifest.csv \
+  --output-csv outputs/benign500_review_flags.csv
+```
+
+这会生成一张独立的复核标记表，默认规则是：
+
+- `preprocess_slice_thickness >= 5.0` 或 `preprocess_spacing_z >= 5.0`：标成 `qc_bucket=thick5_borderline`
+- `thick5_borderline` 默认写成 `review_status=pending`、`use_for_training=0`
+- 其他样本默认写成 `review_status=auto_pass`、`use_for_training=1`
+
+建议人工复核时只改这几列：
+
+- `review_status`：例如改成 `manual_pass` 或 `reject`
+- `use_for_training`：通过改成 `1`，排除保持 `0`
+- `review_note`：记录原因，例如 `localizer`、`coverage_incomplete`、`wrong_series`
+
+复核完成后，再把 flags 应用回 manifest，导出训练用 CSV：
+
+```bash
+python apply_intranet_ct_review_flags.py \
+  --manifest-csv outputs/benign500_manifest.csv \
+  --flags-csv outputs/benign500_review_flags.csv \
+  --output-csv outputs/benign500_manifest_reviewed.csv \
+  --audit-csv outputs/benign500_manifest_with_review.csv
+```
+
+说明：
+
+- `benign500_manifest_reviewed.csv` 只保留 `use_for_training=1` 的样本，适合直接喂训练。
+- `benign500_manifest_with_review.csv` 会保留全部样本并附上复核列，方便留审计记录。
+- 这样后续即使发现问题样本，也优先改 `review_flags.csv` 和 reviewed manifest，不必只靠手工删 `.npy` 管理。
 
 ## 4. 合并旧数据和新增良性
 

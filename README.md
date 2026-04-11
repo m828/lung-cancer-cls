@@ -2,6 +2,7 @@
 
 ## 阶段文档
 
+- [实验总览与执行路线图](./EXPERIMENT_EXECUTION_ROADMAP.md)
 - [二分类阶段记录与后续计划](./BINARY_CT_STAGE_NOTES.md)
 - [CNV Only XGBoost 基线说明](./CNV_XGBOOST_BASELINE.md)
 - [CT + CNV 多模态 V1 说明](./CT_CNV_MULTIMODAL_V1.md)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
@@ -33,6 +33,21 @@ from lung_cancer_cls.train import (
 from lung_cancer_cls.training_components import build_class_weights, create_loss, create_optimizer, create_scheduler
 
 VALID_MODALITIES = ("ct", "text", "cnv")
+VALID_DISTILL_METHODS = ("logits", "fused", "ct", "text", "hint", "relation", "attention")
+DISTILL_METHOD_ALIASES = {
+    "feature": "fused",
+    "features": "fused",
+    "fused_feature": "fused",
+    "fused_features": "fused",
+    "ct_feature": "ct",
+    "ct_features": "ct",
+    "text_feature": "text",
+    "text_features": "text",
+    "rel": "relation",
+    "rkd": "relation",
+    "at": "attention",
+    "attention_transfer": "attention",
+}
 UNSPECIFIED_SPLITS = {"", "none", "nan", "null", "unspecified"}
 
 
@@ -104,6 +119,10 @@ class StudentKDConfig(MultiModalTrainConfig):
     teacher_run_dir: Path | None = None
     distillation_alpha: float = 0.5
     distillation_temperature: float = 4.0
+    distill_methods: Tuple[str, ...] = ("logits",)
+    distillation_method_weights: Dict[str, float] = field(default_factory=dict)
+    distillation_feature_loss: str = "smooth_l1"
+    distillation_normalize_features: bool = False
 
 
 def normalize_modalities(raw: str | Sequence[str]) -> Tuple[str, ...]:
@@ -120,6 +139,84 @@ def normalize_modalities(raw: str | Sequence[str]) -> Tuple[str, ...]:
     if not normalized:
         raise ValueError("At least one modality is required.")
     return tuple(normalized)
+
+
+def _canonical_distill_method(value: str) -> str:
+    method = str(value).strip().lower()
+    method = DISTILL_METHOD_ALIASES.get(method, method)
+    if method not in VALID_DISTILL_METHODS:
+        raise ValueError(
+            f"Unknown distillation method: {value}. "
+            f"Expected one of {', '.join(VALID_DISTILL_METHODS)}."
+        )
+    return method
+
+
+def normalize_distill_methods(raw: str | Sequence[str] | None) -> Tuple[str, ...]:
+    if raw is None:
+        return ("logits",)
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        values = [str(item).strip() for item in raw if str(item).strip()]
+
+    normalized: List[str] = []
+    for value in values:
+        method = _canonical_distill_method(value)
+        if method not in normalized:
+            normalized.append(method)
+    if not normalized:
+        raise ValueError("At least one distillation method is required.")
+    return tuple(normalized)
+
+
+def parse_distillation_method_weights(raw: Any) -> Dict[str, float]:
+    if raw is None or raw == "":
+        return {}
+    items: Iterable[Tuple[str, Any]]
+    if isinstance(raw, dict):
+        items = raw.items()
+    else:
+        text = str(raw).strip()
+        if not text:
+            return {}
+        parsed: Dict[str, str] = {}
+        for chunk in text.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if "=" not in chunk:
+                raise ValueError(
+                    "distillation_method_weights must use 'name=value' pairs, "
+                    f"got: {chunk}"
+                )
+            key, value = chunk.split("=", 1)
+            parsed[key.strip()] = value.strip()
+        items = parsed.items()
+
+    weights: Dict[str, float] = {}
+    for key, value in items:
+        method = _canonical_distill_method(key)
+        weight = float(value)
+        if weight < 0:
+            raise ValueError(f"Distillation weight for {method} must be non-negative, got {weight}.")
+        weights[method] = weight
+    return weights
+
+
+def resolve_distillation_method_weights(
+    methods: Sequence[str],
+    overrides: Dict[str, float] | None = None,
+) -> Dict[str, float]:
+    overrides = overrides or {}
+    resolved: Dict[str, float] = {}
+    for method in normalize_distill_methods(methods):
+        resolved[method] = float(overrides.get(method, 1.0))
+    resolved = {key: value for key, value in resolved.items() if value > 0}
+    if not resolved:
+        raise ValueError("At least one distillation method must have positive weight.")
+    total = sum(resolved.values())
+    return {key: value / total for key, value in resolved.items()}
 
 
 def jsonable_dataclass(config: Any) -> Dict[str, Any]:
@@ -630,6 +727,7 @@ class FlexibleMultiModalClassifier(nn.Module):
     ):
         super().__init__()
         self.modalities = normalize_modalities(modalities)
+        self.fusion_hidden_dim = int(fusion_hidden_dim)
         fusion_dim = 0
 
         if "ct" in self.modalities:
@@ -660,6 +758,7 @@ class FlexibleMultiModalClassifier(nn.Module):
         else:
             self.gene_encoder = None
             self.gene_feature_dim = 0
+        self.fusion_input_dim = int(fusion_dim)
 
         self.classifier = nn.Sequential(
             nn.Linear(fusion_dim, fusion_hidden_dim),
@@ -668,16 +767,84 @@ class FlexibleMultiModalClassifier(nn.Module):
             nn.Linear(fusion_hidden_dim, num_classes),
         )
 
-    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        features: List[torch.Tensor] = []
+    def encode_modalities(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        features: Dict[str, torch.Tensor] = {}
         if self.ct_encoder is not None:
-            features.append(self.ct_encoder(inputs["ct"]))
+            features["ct"] = self.ct_encoder(inputs["ct"])
         if self.text_encoder is not None:
-            features.append(self.text_encoder(inputs["text_num"], inputs["text_emb"]))
+            features["text"] = self.text_encoder(inputs["text_num"], inputs["text_emb"])
         if self.gene_encoder is not None:
-            features.append(self.gene_encoder(inputs["cnv"]))
-        fused = torch.cat(features, dim=1)
-        return self.classifier(fused)
+            features["cnv"] = self.gene_encoder(inputs["cnv"])
+        return features
+
+    def forward_outputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        modal_features = self.encode_modalities(inputs)
+        fused_input = torch.cat([modal_features[name] for name in self.modalities], dim=1)
+        fused_hidden = self.classifier[:3](fused_input)
+        logits = self.classifier[3](fused_hidden)
+        return {
+            "logits": logits,
+            "fused_input": fused_input,
+            "fused": fused_hidden,
+            "modal_features": modal_features,
+        }
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.forward_outputs(inputs)["logits"]
+
+
+class DistillationProjector(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int):
+        super().__init__()
+        if int(input_dim) == int(output_dim):
+            self.project = nn.Identity()
+        else:
+            self.project = nn.Linear(int(input_dim), int(output_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(x)
+
+
+class DistillationProjectorBank(nn.Module):
+    def __init__(
+        self,
+        student: FlexibleMultiModalClassifier,
+        teacher: FlexibleMultiModalClassifier,
+        methods: Sequence[str],
+    ):
+        super().__init__()
+        self.methods = normalize_distill_methods(methods)
+        self.projectors = nn.ModuleDict()
+        for method in self.methods:
+            if method == "logits":
+                continue
+            self.projectors[method] = DistillationProjector(
+                input_dim=self._feature_dim(student, method),
+                output_dim=self._feature_dim(teacher, method),
+            )
+
+    @staticmethod
+    def _feature_dim(model: FlexibleMultiModalClassifier, method: str) -> int:
+        if method == "fused":
+            return int(model.fusion_hidden_dim)
+        if method == "attention":
+            return int(model.fusion_hidden_dim)
+        if method == "hint":
+            return int(model.fusion_input_dim)
+        if method == "ct":
+            if model.ct_encoder is None:
+                raise ValueError("CT feature distillation requested but model has no CT encoder.")
+            return int(model.ct_feature_dim)
+        if method == "text":
+            if model.text_encoder is None:
+                raise ValueError("Text feature distillation requested but model has no text encoder.")
+            return int(model.text_feature_dim)
+        raise ValueError(f"Unsupported feature distillation method: {method}")
+
+    def forward(self, method: str, tensor: torch.Tensor) -> torch.Tensor:
+        if method not in self.projectors:
+            return tensor
+        return self.projectors[method](tensor)
 
 
 def move_inputs_to_device(
@@ -789,6 +956,66 @@ def distillation_loss(
     ) * (temp ** 2)
 
 
+def feature_distillation_loss(
+    student_features: torch.Tensor,
+    teacher_features: torch.Tensor,
+    loss_name: str = "smooth_l1",
+    normalize: bool = False,
+) -> torch.Tensor:
+    if normalize:
+        student_features = F.normalize(student_features, dim=1)
+        teacher_features = F.normalize(teacher_features, dim=1)
+
+    name = str(loss_name).strip().lower()
+    if name == "mse":
+        return F.mse_loss(student_features, teacher_features)
+    if name == "smooth_l1":
+        return F.smooth_l1_loss(student_features, teacher_features)
+    if name == "cosine":
+        return (1.0 - F.cosine_similarity(student_features, teacher_features, dim=1)).mean()
+    raise ValueError(f"Unknown distillation feature loss: {loss_name}")
+
+
+def relation_distillation_loss(
+    student_features: torch.Tensor,
+    teacher_features: torch.Tensor,
+) -> torch.Tensor:
+    student_rel = F.normalize(student_features, dim=1) @ F.normalize(student_features, dim=1).T
+    teacher_rel = F.normalize(teacher_features, dim=1) @ F.normalize(teacher_features, dim=1).T
+    return F.smooth_l1_loss(student_rel, teacher_rel)
+
+
+def attention_transfer_loss(
+    student_features: torch.Tensor,
+    teacher_features: torch.Tensor,
+) -> torch.Tensor:
+    student_attention = F.normalize(student_features.pow(2), p=1, dim=1)
+    teacher_attention = F.normalize(teacher_features.pow(2), p=1, dim=1)
+    return F.smooth_l1_loss(student_attention, teacher_attention)
+
+
+def validate_distillation_methods(
+    student_modalities: Sequence[str],
+    teacher_modalities: Sequence[str],
+    methods: Sequence[str],
+) -> Tuple[str, ...]:
+    normalized = normalize_distill_methods(methods)
+    student_set = set(normalize_modalities(student_modalities))
+    teacher_set = set(normalize_modalities(teacher_modalities))
+    missing: List[str] = []
+    for method in normalized:
+        if method == "ct" and ("ct" not in student_set or "ct" not in teacher_set):
+            missing.append(method)
+        if method == "text" and ("text" not in student_set or "text" not in teacher_set):
+            missing.append(method)
+    if missing:
+        raise ValueError(
+            "Selected distillation methods are incompatible with teacher/student modalities: "
+            + ", ".join(sorted(set(missing)))
+        )
+    return normalized
+
+
 def train_epoch_student_kd(
     student: nn.Module,
     teacher: nn.Module,
@@ -798,12 +1025,20 @@ def train_epoch_student_kd(
     optimizer: torch.optim.Optimizer,
     alpha: float,
     temperature: float,
+    distill_methods: Sequence[str],
+    distill_method_weights: Dict[str, float],
+    distill_projectors: DistillationProjectorBank,
+    distillation_feature_loss_name: str = "smooth_l1",
+    distillation_normalize_features: bool = False,
     scheduler: Any = None,
     scheduler_step_per_batch: bool = False,
-) -> float:
+) -> Dict[str, float]:
     student.train()
     teacher.eval()
     running_loss = 0.0
+    running_ce = 0.0
+    running_kd = 0.0
+    running_components = {method: 0.0 for method in normalize_distill_methods(distill_methods)}
     seen = 0
 
     for inputs, labels in loader:
@@ -811,11 +1046,55 @@ def train_epoch_student_kd(
         labels = labels.to(device)
 
         optimizer.zero_grad()
-        student_logits = student(inputs)
+        student_outputs = student.forward_outputs(inputs)
         with torch.no_grad():
-            teacher_logits = teacher(inputs)
-        ce = criterion(student_logits, labels)
-        kd = distillation_loss(student_logits, teacher_logits, temperature=temperature)
+            teacher_outputs = teacher.forward_outputs(inputs)
+        ce = criterion(student_outputs["logits"], labels)
+        component_losses: Dict[str, torch.Tensor] = {}
+        for method in running_components:
+            if method == "logits":
+                component_losses[method] = distillation_loss(
+                    student_outputs["logits"],
+                    teacher_outputs["logits"],
+                    temperature=temperature,
+                )
+            elif method == "fused":
+                component_losses[method] = feature_distillation_loss(
+                    distill_projectors("fused", student_outputs["fused"]),
+                    teacher_outputs["fused"],
+                    loss_name=distillation_feature_loss_name,
+                    normalize=distillation_normalize_features,
+                )
+            elif method == "hint":
+                component_losses[method] = feature_distillation_loss(
+                    distill_projectors("hint", student_outputs["fused_input"]),
+                    teacher_outputs["fused_input"],
+                    loss_name=distillation_feature_loss_name,
+                    normalize=distillation_normalize_features,
+                )
+            elif method == "relation":
+                component_losses[method] = relation_distillation_loss(
+                    student_outputs["fused"],
+                    teacher_outputs["fused"],
+                )
+            elif method == "attention":
+                component_losses[method] = attention_transfer_loss(
+                    distill_projectors("attention", student_outputs["fused"]),
+                    teacher_outputs["fused"],
+                )
+            elif method in {"ct", "text"}:
+                component_losses[method] = feature_distillation_loss(
+                    distill_projectors(method, student_outputs["modal_features"][method]),
+                    teacher_outputs["modal_features"][method],
+                    loss_name=distillation_feature_loss_name,
+                    normalize=distillation_normalize_features,
+                )
+            else:
+                raise ValueError(f"Unsupported distillation method: {method}")
+        kd = sum(
+            distill_method_weights[method] * component_losses[method]
+            for method in component_losses
+        )
         loss = (1.0 - alpha) * ce + alpha * kd
         loss.backward()
         optimizer.step()
@@ -823,9 +1102,19 @@ def train_epoch_student_kd(
             scheduler.step()
 
         running_loss += loss.item() * labels.size(0)
+        running_ce += ce.item() * labels.size(0)
+        running_kd += kd.item() * labels.size(0)
+        for method, component in component_losses.items():
+            running_components[method] += component.item() * labels.size(0)
         seen += labels.size(0)
 
-    return running_loss / max(seen, 1)
+    denom = max(seen, 1)
+    return {
+        "loss": running_loss / denom,
+        "ce_loss": running_ce / denom,
+        "kd_loss": running_kd / denom,
+        **{f"kd_{method}_loss": value / denom for method, value in running_components.items()},
+    }
 
 
 def predict_probabilities(
@@ -1228,6 +1517,10 @@ def config_from_dict(raw: Dict[str, Any], config_cls: type[MultiModalTrainConfig
             data[key] = None
     if "modalities" in data:
         data["modalities"] = normalize_modalities(data["modalities"])
+    if "distill_methods" in data:
+        data["distill_methods"] = normalize_distill_methods(data["distill_methods"])
+    if "distillation_method_weights" in data:
+        data["distillation_method_weights"] = parse_distillation_method_weights(data["distillation_method_weights"])
     field_names = set(config_cls.__dataclass_fields__.keys())
     filtered = {key: value for key, value in data.items() if key in field_names}
     return config_cls(**filtered)
@@ -1275,6 +1568,8 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
 
     set_seed(config.seed)
     config.modalities = normalize_modalities(config.modalities)
+    config.distill_methods = normalize_distill_methods(config.distill_methods)
+    config.distillation_method_weights = parse_distillation_method_weights(config.distillation_method_weights)
     if "ct" not in config.modalities or "cnv" in config.modalities:
         raise ValueError("Student modalities must be `ct` or `ct,text`.")
 
@@ -1284,12 +1579,19 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
     teacher_metrics, teacher_config, teacher_modalities, _ = load_teacher_bundle(config.teacher_run_dir)
     config = inherit_paths_from_teacher(config, teacher_config)
     required_modalities = normalize_modalities(list(teacher_modalities) + list(config.modalities))
+    config.distill_methods = validate_distillation_methods(config.modalities, teacher_modalities, config.distill_methods)
+    resolved_distill_weights = resolve_distillation_method_weights(
+        config.distill_methods,
+        config.distillation_method_weights,
+    )
+    config.distillation_method_weights = dict(resolved_distill_weights)
 
     print("=" * 60)
     print("Student KD training")
     print(f"Teacher dir: {config.teacher_run_dir}")
     print(f"Teacher modalities: {','.join(teacher_modalities)}")
     print(f"Student modalities: {','.join(config.modalities)}")
+    print(f"Distill methods: {','.join(config.distill_methods)}")
     print(f"Output dir: {config.output_dir}")
     print("=" * 60)
 
@@ -1331,7 +1633,17 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
     teacher_model.eval()
 
     student_model = create_model_from_config(config, feature_info, class_names).to(device)
-    optimizer = create_optimizer(config.optimizer_name, student_model.parameters(), config.lr, config.weight_decay)
+    distill_projectors = DistillationProjectorBank(
+        student=student_model,
+        teacher=teacher_model,
+        methods=config.distill_methods,
+    ).to(device)
+    optimizer = create_optimizer(
+        config.optimizer_name,
+        list(student_model.parameters()) + list(distill_projectors.parameters()),
+        config.lr,
+        config.weight_decay,
+    )
     criterion = create_loss(
         config.loss_name,
         label_smoothing=config.label_smoothing,
@@ -1359,7 +1671,7 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
     print("-" * 60)
 
     for epoch in range(1, config.epochs + 1):
-        train_loss = train_epoch_student_kd(
+        train_stats = train_epoch_student_kd(
             student_model,
             teacher_model,
             train_loader,
@@ -1368,6 +1680,11 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
             optimizer,
             alpha=config.distillation_alpha,
             temperature=config.distillation_temperature,
+            distill_methods=config.distill_methods,
+            distill_method_weights=resolved_distill_weights,
+            distill_projectors=distill_projectors,
+            distillation_feature_loss_name=config.distillation_feature_loss,
+            distillation_normalize_features=config.distillation_normalize_features,
             scheduler=scheduler,
             scheduler_step_per_batch=scheduler_step_per_batch,
         )
@@ -1382,19 +1699,27 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
 
         epoch_log = {
             "epoch": epoch,
-            "train_loss": train_loss,
+            "train_loss": train_stats["loss"],
+            "train_ce_loss": train_stats["ce_loss"],
+            "train_kd_loss": train_stats["kd_loss"],
             "selection_metric": selection_metric,
             "selection_metric_used": used_metric,
             "selection_score": _safe_float(selection_score),
             "distillation_alpha": config.distillation_alpha,
             "distillation_temperature": config.distillation_temperature,
+            "distill_methods": list(config.distill_methods),
+            "distillation_feature_loss": config.distillation_feature_loss,
         }
+        for method in config.distill_methods:
+            epoch_log[f"train_kd_{method}_loss"] = train_stats.get(f"kd_{method}_loss")
         epoch_log.update({f"val_{k}": v for k, v in build_epoch_log(val_metrics).items()})
         history.append(epoch_log)
 
         print(
             f"[Epoch {epoch}/{config.epochs}] "
-            f"train_loss={train_loss:.4f} "
+            f"train_loss={train_stats['loss']:.4f} "
+            f"train_ce={train_stats['ce_loss']:.4f} "
+            f"train_kd={train_stats['kd_loss']:.4f} "
             f"val_loss={_format_metric(_safe_float(val_metrics.get('loss')))} "
             f"val_acc={_format_metric(_safe_float(val_metrics.get('accuracy')))} "
             f"val_auc={_format_metric(_safe_float(val_metrics.get('auroc')))} "
@@ -1563,6 +1888,34 @@ def build_student_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-run-dir", type=Path, required=True, help="Teacher run directory containing best_model.pt and metrics.json.")
     parser.add_argument("--distillation-alpha", type=float, default=0.5, help="KD loss weight.")
     parser.add_argument("--distillation-temperature", type=float, default=4.0, help="KD temperature.")
+    parser.add_argument(
+        "--distill-methods",
+        type=str,
+        default="logits",
+        help=(
+            "Comma-separated KD methods among logits,fused,ct,text,hint,relation,attention. "
+            "Aliases feature->fused, ct_feature->ct, text_feature->text, "
+            "rkd->relation, at->attention are supported."
+        ),
+    )
+    parser.add_argument(
+        "--distill-method-weights",
+        type=str,
+        default="",
+        help="Optional per-method weights like logits=1,fused=0.5,ct=1. Unspecified selected methods default to 1.",
+    )
+    parser.add_argument(
+        "--distill-feature-loss",
+        type=str,
+        choices=["mse", "smooth_l1", "cosine"],
+        default="smooth_l1",
+        help="Feature loss used for fused / ct / text distillation.",
+    )
+    parser.add_argument(
+        "--distill-normalize-features",
+        action="store_true",
+        help="L2-normalize feature vectors before fused / branch feature distillation.",
+    )
     return parser
 
 
@@ -1696,6 +2049,10 @@ def parse_student_args() -> StudentKDConfig:
         teacher_run_dir=args.teacher_run_dir,
         distillation_alpha=args.distillation_alpha,
         distillation_temperature=args.distillation_temperature,
+        distill_methods=normalize_distill_methods(args.distill_methods),
+        distillation_method_weights=parse_distillation_method_weights(args.distill_method_weights),
+        distillation_feature_loss=args.distill_feature_loss,
+        distillation_normalize_features=args.distill_normalize_features,
     )
 
 

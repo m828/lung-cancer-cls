@@ -13,6 +13,8 @@ if str(SRC) not in sys.path:
 from lung_cancer_cls.multimodal_teacher_student import (
     MultiModalTrainConfig,
     StudentKDConfig,
+    normalize_distill_methods,
+    parse_distillation_method_weights,
     train_multimodal_model,
     train_student_kd,
 )
@@ -213,4 +215,89 @@ def test_multimodal_teacher_student_smoke(tmp_path: Path):
     assert student_metrics["family"] == "student_kd"
     assert student_metrics["teacher_modalities"] == ["ct", "cnv", "text"]
     assert student_metrics["split_source"] == "teacher_manifest"
+    assert student_metrics["config"]["distill_methods"] == ["logits"]
+    assert "train_kd_logits_loss" in student_metrics["history"][0]
     assert (tmp_path / "student_ct" / "best_model.pt").exists()
+
+    student_ct_text_metrics = train_student_kd(
+        StudentKDConfig(
+            data_root=tmp_path,
+            metadata_csv=meta_csv,
+            output_dir=tmp_path / "student_ct_text_combo",
+            modalities=("ct", "text"),
+            ct_root=ct_root,
+            gene_tsv=gene_tsv,
+            text_feature_tsv=text_tsv,
+            teacher_run_dir=tmp_path / "teacher",
+            use_predefined_split=True,
+            epochs=1,
+            batch_size=2,
+            num_workers=0,
+            cpu=True,
+            ct_model="attention3d_cnn",
+            depth_size=8,
+            volume_hw=32,
+            ct_feature_dim=16,
+            text_feature_dim=8,
+            gene_hidden_dim=8,
+            fusion_hidden_dim=8,
+            distill_methods=("logits", "fused", "hint", "relation", "attention", "ct", "text"),
+            distillation_method_weights={
+                "logits": 1.0,
+                "fused": 0.5,
+                "hint": 0.5,
+                "relation": 0.25,
+                "attention": 0.25,
+                "ct": 0.5,
+                "text": 0.25,
+            },
+            distillation_feature_loss="cosine",
+            distillation_normalize_features=True,
+            save_predictions=False,
+        )
+    )
+    assert student_ct_text_metrics["config"]["distill_methods"] == [
+        "logits",
+        "fused",
+        "hint",
+        "relation",
+        "attention",
+        "ct",
+        "text",
+    ]
+    assert set(student_ct_text_metrics["config"]["distillation_method_weights"]) == {
+        "logits",
+        "fused",
+        "hint",
+        "relation",
+        "attention",
+        "ct",
+        "text",
+    }
+    history_row = student_ct_text_metrics["history"][0]
+    assert "train_kd_fused_loss" in history_row
+    assert "train_kd_hint_loss" in history_row
+    assert "train_kd_relation_loss" in history_row
+    assert "train_kd_attention_loss" in history_row
+    assert "train_kd_ct_loss" in history_row
+    assert "train_kd_text_loss" in history_row
+
+
+def test_distillation_method_helpers():
+    assert normalize_distill_methods("logits,feature,ct_feature,text,rkd,at,hint") == (
+        "logits",
+        "fused",
+        "ct",
+        "text",
+        "relation",
+        "attention",
+        "hint",
+    )
+    assert parse_distillation_method_weights("logits=2,feature=1,ct_feature=0.5,rkd=0.25,at=0.25,hint=0.75") == {
+        "logits": 2.0,
+        "fused": 1.0,
+        "ct": 0.5,
+        "relation": 0.25,
+        "attention": 0.25,
+        "hint": 0.75,
+    }

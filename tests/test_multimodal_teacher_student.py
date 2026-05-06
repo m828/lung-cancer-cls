@@ -4,6 +4,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -13,6 +14,7 @@ if str(SRC) not in sys.path:
 from lung_cancer_cls.multimodal_teacher_student import (
     MultiModalTrainConfig,
     StudentKDConfig,
+    TextClinicalEncoder,
     normalize_distill_methods,
     parse_distillation_method_weights,
     train_multimodal_model,
@@ -301,3 +303,10 @@ def test_distillation_method_helpers():
         "attention": 0.25,
         "hint": 0.75,
     }
+
+
+def test_text_encoder_supports_batch_size_one_in_train_mode():
+    encoder = TextClinicalEncoder(num_dim=6, text_dim=16, output_dim=32, dropout=0.0)
+    encoder.train()
+    out = encoder(torch.randn(1, 6), torch.randn(1, 16))
+    assert out.shape == (1, 32)

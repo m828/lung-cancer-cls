@@ -361,17 +361,32 @@ class DenseNet3DCTClassifier(nn.Module):
     def __init__(self, num_classes: int = 3, growth_rate: int = 16):
         super().__init__()
 
-        def dense_block(in_ch: int, layers: int):
-            blocks = []
-            ch = in_ch
-            for _ in range(layers):
-                blocks.extend([
-                    nn.BatchNorm3d(ch),
-                    nn.ReLU(inplace=True),
-                    nn.Conv3d(ch, growth_rate, kernel_size=3, padding=1, bias=False),
-                ])
-                ch += growth_rate
-            return nn.Sequential(*blocks), ch
+        class _DenseLayer(nn.Module):
+            def __init__(self, in_ch: int, growth: int):
+                super().__init__()
+                self.norm = nn.BatchNorm3d(in_ch)
+                self.relu = nn.ReLU(inplace=True)
+                self.conv = nn.Conv3d(in_ch, growth, kernel_size=3, padding=1, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                new_feat = self.conv(self.relu(self.norm(x)))
+                return torch.cat([x, new_feat], dim=1)
+
+        class _DenseBlock(nn.Module):
+            def __init__(self, in_ch: int, layers: int, growth: int):
+                super().__init__()
+                dense_layers = []
+                ch = in_ch
+                for _ in range(layers):
+                    dense_layers.append(_DenseLayer(ch, growth))
+                    ch += growth
+                self.layers = nn.ModuleList(dense_layers)
+                self.out_channels = ch
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for layer in self.layers:
+                    x = layer(x)
+                return x
 
         self.stem = nn.Sequential(
             nn.Conv3d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
@@ -379,21 +394,24 @@ class DenseNet3DCTClassifier(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.block1, ch1 = dense_block(32, 3)
+        self.block1 = _DenseBlock(32, 3, growth_rate)
+        ch1 = self.block1.out_channels
         self.trans1 = nn.Sequential(
             nn.BatchNorm3d(ch1),
             nn.ReLU(inplace=True),
             nn.Conv3d(ch1, 64, kernel_size=1, bias=False),
             nn.AvgPool3d(2),
         )
-        self.block2, ch2 = dense_block(64, 3)
+        self.block2 = _DenseBlock(64, 3, growth_rate)
+        ch2 = self.block2.out_channels
         self.trans2 = nn.Sequential(
             nn.BatchNorm3d(ch2),
             nn.ReLU(inplace=True),
             nn.Conv3d(ch2, 128, kernel_size=1, bias=False),
             nn.AvgPool3d(2),
         )
-        self.block3, ch3 = dense_block(128, 3)
+        self.block3 = _DenseBlock(128, 3, growth_rate)
+        ch3 = self.block3.out_channels
         self.head = nn.Sequential(
             nn.BatchNorm3d(ch3),
             nn.ReLU(inplace=True),

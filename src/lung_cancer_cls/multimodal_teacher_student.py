@@ -624,11 +624,11 @@ class TextClinicalEncoder(nn.Module):
             hidden = max(128, min(512, self.num_dim * 2))
             self.num_branch = nn.Sequential(
                 nn.Linear(self.num_dim, hidden),
-                nn.BatchNorm1d(hidden),
+                SafeBatchNorm1d(hidden),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.Linear(hidden, branch_dim),
-                nn.BatchNorm1d(branch_dim),
+                SafeBatchNorm1d(branch_dim),
                 nn.ReLU(inplace=True),
             )
 
@@ -637,11 +637,11 @@ class TextClinicalEncoder(nn.Module):
             hidden = max(256, min(768, max(self.text_dim // 2, branch_dim * 2)))
             self.text_branch = nn.Sequential(
                 nn.Linear(self.text_dim, hidden),
-                nn.BatchNorm1d(hidden),
+                SafeBatchNorm1d(hidden),
                 nn.ReLU(inplace=True),
                 nn.Dropout(dropout),
                 nn.Linear(hidden, branch_dim),
-                nn.BatchNorm1d(branch_dim),
+                SafeBatchNorm1d(branch_dim),
                 nn.ReLU(inplace=True),
             )
 
@@ -654,7 +654,7 @@ class TextClinicalEncoder(nn.Module):
             )
             self.fused_proj = nn.Sequential(
                 nn.Linear(branch_dim * 2, output_dim),
-                nn.BatchNorm1d(output_dim),
+                SafeBatchNorm1d(output_dim),
                 nn.ReLU(inplace=True),
             )
             self.single_num_proj = None
@@ -697,7 +697,7 @@ class CNVEncoder(nn.Module):
         self.output_dim = hidden_dim
         self.net = nn.Sequential(
             nn.Linear(input_dim, mid_dim),
-            nn.BatchNorm1d(mid_dim),
+            SafeBatchNorm1d(mid_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(mid_dim, hidden_dim),
@@ -707,6 +707,24 @@ class CNVEncoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
+
+
+class SafeBatchNorm1d(nn.BatchNorm1d):
+    """BatchNorm1d that avoids training-time crash when batch size == 1."""
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.training and input.dim() == 2 and input.size(0) <= 1:
+            return F.batch_norm(
+                input,
+                self.running_mean,
+                self.running_var,
+                self.weight,
+                self.bias,
+                training=False,
+                momentum=0.0,
+                eps=self.eps,
+            )
+        return super().forward(input)
 
 
 class FlexibleMultiModalClassifier(nn.Module):
@@ -816,7 +834,7 @@ class DistillationProjectorBank(nn.Module):
         self.methods = normalize_distill_methods(methods)
         self.projectors = nn.ModuleDict()
         for method in self.methods:
-            if method == "logits":
+            if method in {"logits", "relation"}:
                 continue
             self.projectors[method] = DistillationProjector(
                 input_dim=self._feature_dim(student, method),

@@ -444,6 +444,105 @@ class DenseNet3D_121(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
 
+class HierarchicalMultiTaskClassifier(nn.Module):
+    """层次化多任务分类器：共享 backbone + 三个分类 head。
+
+    受 Subregion-Unet 思想启发，将类别分组作为"mask"并行训练：
+      - Head A: 0 vs [1,2]  (健康 vs 非健康)
+      - Head B: 0, 1, 2     (标准三分类，主输出)
+      - Head C: 1 vs 2      (良性 vs 恶性，仅对非健康样本有效)
+
+    训练时返回三个 head 的 logits；推理时仅返回主 head (B) 的输出。
+    """
+
+    def __init__(
+        self,
+        backbone_name: str = "resnet3d18",
+        num_classes: int = 3,
+        pretrained: bool = False,
+        hidden_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        # 共享 backbone（去掉原始分类头）
+        base_model = build_model(backbone_name, num_classes=3, pretrained=pretrained)
+        if hasattr(base_model, "backbone"):
+            self.backbone = base_model.backbone
+        else:
+            self.backbone = base_model
+
+        # 探测 backbone 输出维度
+        feat_dim = self._infer_feature_dim(backbone_name)
+
+        self.backbone_proj = nn.Sequential(
+            nn.AdaptiveAvgPool3d(1) if self._is_3d(backbone_name) else nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(1),
+            nn.Linear(feat_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+
+        # Head A: 健康 vs 非健康 (binary)
+        self.head_abnormal = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2),
+        )
+
+        # Head B: 标准三分类 (主输出)
+        self.head_main = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+
+        # Head C: 良性 vs 恶性 (binary, 仅对非健康样本)
+        self.head_benign_malignant = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 2),
+        )
+
+        self._hidden_dim = hidden_dim
+
+    @staticmethod
+    def _is_3d(backbone_name: str) -> bool:
+        return backbone_name in {
+            "resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny",
+            "densenet3d", "densenet3d_121", "attention3d_cnn",
+        }
+
+    @staticmethod
+    def _infer_feature_dim(backbone_name: str) -> int:
+        dim_map = {
+            "simple": 128, "resnet18": 512, "resnet18_se": 512,
+            "resnet18_cbam": 512, "efficientnet_b0": 1280,
+            "convnext_tiny": 768, "resnet3d18": 512, "mc3_18": 512,
+            "r2plus1d_18": 512, "swin3d_tiny": 768, "densenet3d": 128,
+            "densenet3d_121": 1024, "attention3d_cnn": 128,
+        }
+        if backbone_name not in dim_map:
+            raise ValueError(f"Unknown backbone for feature dim: {backbone_name}")
+        return dim_map[backbone_name]
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.backbone(x)
+        return self.backbone_proj(feat)
+
+    def forward(self, x: torch.Tensor):
+        feat = self.extract_features(x)
+        logits_abnormal = self.head_abnormal(feat)
+        logits_main = self.head_main(feat)
+        logits_bm = self.head_benign_malignant(feat)
+
+        if self.training:
+            return logits_main, logits_abnormal, logits_bm
+        return logits_main
+
+
 def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False) -> nn.Module:
     """模型工厂，便于脚本化组合和消融。"""
     name = model_name.lower().strip()

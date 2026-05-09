@@ -71,16 +71,15 @@ from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from lung_cancer_cls.dataset import (
     DatasetType,
-    INTRANET_LABEL_MAP,
     create_dataset,
     get_default_transforms,
     get_default_volume_transforms,
-    remap_samples_by_class_mode,
 )
 from lung_cancer_cls.model import HierarchicalMultiTaskClassifier
 from lung_cancer_cls.train import (
     build_epoch_log,
     compute_classification_metrics,
+    remap_samples_by_class_mode,
     resolve_selection_metric,
     resolve_selection_score,
     set_seed,

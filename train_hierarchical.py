@@ -60,6 +60,7 @@ import json
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -69,28 +70,118 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
-from lung_cancer_cls.dataset import (
-    DatasetType,
-    create_dataset,
-    get_default_transforms,
-    get_default_volume_transforms,
-)
-from lung_cancer_cls.model import HierarchicalMultiTaskClassifier
-from lung_cancer_cls.train import (
-    build_epoch_log,
-    compute_classification_metrics,
-    remap_samples_by_class_mode,
-    resolve_selection_metric,
-    resolve_selection_score,
-    set_seed,
-    stratified_split,
-)
-from lung_cancer_cls.training_components import (
-    HierarchicalMultiTaskLoss,
-    build_class_weights,
-    create_optimizer,
-    create_scheduler,
-)
+try:
+    from lung_cancer_cls.dataset import (
+        DatasetType,
+        create_dataset,
+        get_default_transforms,
+        get_default_volume_transforms,
+        IntranetCTDataset,
+    )
+    from lung_cancer_cls.model import HierarchicalMultiTaskClassifier
+    from lung_cancer_cls.train import (
+        build_epoch_log,
+        compute_classification_metrics,
+        remap_samples_by_class_mode,
+        resolve_selection_metric,
+        resolve_selection_score,
+        set_seed,
+        stratified_split,
+        stratified_train_val_split,
+    )
+    from lung_cancer_cls.training_components import (
+        HierarchicalMultiTaskLoss,
+        build_class_weights,
+        create_optimizer,
+        create_scheduler,
+    )
+except ModuleNotFoundError:
+    # Fallback for running this script directly from repository root (src/ layout).
+    REPO_ROOT = Path(__file__).resolve().parent
+    SRC_DIR = REPO_ROOT / "src"
+    if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+    from lung_cancer_cls.dataset import (
+        DatasetType,
+        create_dataset,
+        get_default_transforms,
+        get_default_volume_transforms,
+        IntranetCTDataset,
+    )
+    from lung_cancer_cls.model import HierarchicalMultiTaskClassifier
+    from lung_cancer_cls.train import (
+        build_epoch_log,
+        compute_classification_metrics,
+        remap_samples_by_class_mode,
+        resolve_selection_metric,
+        resolve_selection_score,
+        set_seed,
+        stratified_split,
+        stratified_train_val_split,
+    )
+    from lung_cancer_cls.training_components import (
+        HierarchicalMultiTaskLoss,
+        build_class_weights,
+        create_optimizer,
+        create_scheduler,
+    )
+
+
+@dataclass
+class HierarchicalConfig:
+    dataset_type: DatasetType
+    data_root: str
+    metadata_csv: str | None
+    ct_root: str | None
+    intranet_source: str
+    bundle_nm_path: str | None
+    bundle_bn_path: str | None
+    bundle_mt_path: str | None
+    split_manifest_csv: str | None
+    split_fold: int
+    output_dir: str
+    class_mode: str
+    binary_task: str
+    split_mode: str
+    train_ratio: float
+    use_predefined_split: bool
+    selection_metric: str
+    backbone: str
+    pretrained: bool
+    use_3d_input: bool
+    depth_size: int
+    volume_hw: int
+    image_size: int
+    hidden_dim: int
+    dropout: float
+    epochs: int
+    batch_size: int
+    num_workers: int
+    lr: float
+    weight_decay: float
+    optimizer: str
+    scheduler: str
+    aug_profile: str
+    sampling_strategy: str
+    class_weight_strategy: str
+    effective_num_beta: float
+    label_smoothing: float
+    cpu: bool
+    seed: int
+    weight_abnormal: float
+    weight_main: float
+    weight_benign_malignant: float
+    eval_mode: str
+    bm_mixup: bool
+    bm_mixup_alpha: float
+    ca_ft: bool
+    ca_ft_start: int | None
+    ca_ft_boost: float
+    focal_gammas: list[float] | None
+
+
+def _build_config(ns: argparse.Namespace) -> HierarchicalConfig:
+    return HierarchicalConfig(**vars(ns))
 
 
 # ---------------------------------------------------------------------------
@@ -396,39 +487,101 @@ def train_epoch_confusion_aware(
 # 数据集构建
 # ---------------------------------------------------------------------------
 
-def _build_dataset(args):
+def _build_dataset(config):
     dataset_kwargs: Dict[str, Any] = {}
-    if args.dataset_type == DatasetType.INTRANET_CT:
-        if args.metadata_csv:
-            dataset_kwargs["metadata_csv"] = args.metadata_csv
-        if args.ct_root:
-            dataset_kwargs["ct_root"] = args.ct_root
-        dataset_kwargs["intranet_source"] = args.intranet_source
-        if args.bundle_nm_path:
-            dataset_kwargs["bundle_nm_path"] = args.bundle_nm_path
-        if args.bundle_bn_path:
-            dataset_kwargs["bundle_bn_path"] = args.bundle_bn_path
-        if args.bundle_mt_path:
-            dataset_kwargs["bundle_mt_path"] = args.bundle_mt_path
-    if args.use_3d_input:
+    if config.dataset_type == DatasetType.INTRANET_CT:
+        if config.metadata_csv:
+            dataset_kwargs["metadata_csv"] = Path(config.metadata_csv)
+        if config.ct_root:
+            dataset_kwargs["ct_root"] = Path(config.ct_root)
+        dataset_kwargs["intranet_source"] = config.intranet_source
+        if config.bundle_nm_path:
+            dataset_kwargs["bundle_nm_path"] = Path(config.bundle_nm_path)
+        if config.bundle_bn_path:
+            dataset_kwargs["bundle_bn_path"] = Path(config.bundle_bn_path)
+        if config.bundle_mt_path:
+            dataset_kwargs["bundle_mt_path"] = Path(config.bundle_mt_path)
+    if config.use_3d_input:
         dataset_kwargs["use_3d"] = True
-        dataset_kwargs["depth_size"] = args.depth_size
-        dataset_kwargs["volume_hw"] = args.volume_hw
-    if args.split_manifest_csv:
-        dataset_kwargs["split_manifest_csv"] = args.split_manifest_csv
-        dataset_kwargs["split_fold"] = args.split_fold
-    return create_dataset(args.dataset_type, args.data_root, **dataset_kwargs)
+        dataset_kwargs["depth_size"] = config.depth_size
+        dataset_kwargs["volume_hw"] = config.volume_hw
+    if config.split_manifest_csv:
+        dataset_kwargs["split_manifest_csv"] = Path(config.split_manifest_csv)
+        dataset_kwargs["split_fold"] = config.split_fold
+    root = Path(config.data_root)
+    return create_dataset(config.dataset_type, root, **dataset_kwargs)
 
 
-def _build_transforms(args):
-    if args.use_3d_input:
-        train_tf = get_default_volume_transforms(args.volume_hw, args.depth_size, aug_profile=args.aug_profile, is_train=True)
-        val_tf = get_default_volume_transforms(args.volume_hw, args.depth_size, aug_profile="basic", is_train=False)
+
+
+def _parse_dataset_type(dataset_type: str) -> DatasetType:
+    mapping = {
+        "iqothnccd": DatasetType.IQ_OTHNCCD,
+        "luna16": DatasetType.LUNA16,
+        "lidc_idri": DatasetType.LIDC_IDRI,
+        "intranet_ct": DatasetType.INTRANET_CT,
+    }
+    key = str(dataset_type).strip().lower()
+    if key not in mapping:
+        raise ValueError(f"Unsupported dataset type: {dataset_type}")
+    return mapping[key]
+def _build_transforms(config):
+    if config.use_3d_input:
+        train_tf, val_tf = get_default_volume_transforms(aug_profile=config.aug_profile)
     else:
-        train_tf = get_default_transforms(args.image_size, aug_profile=args.aug_profile, is_train=True)
-        val_tf = get_default_transforms(args.image_size, aug_profile="basic", is_train=False)
+        train_tf = get_default_transforms(config.image_size, aug_profile=config.aug_profile, is_train=True)
+        val_tf = get_default_transforms(config.image_size, aug_profile="basic", is_train=False)
     return train_tf, val_tf
 
+
+
+
+
+
+def _build_dataset_from_samples(base_dataset, samples, transform, config):
+    kwargs = {"samples": samples, "transform": transform}
+    if isinstance(base_dataset, IntranetCTDataset):
+        kwargs.update(
+            use_3d=config.use_3d_input,
+            depth_size=config.depth_size,
+            volume_hw=config.volume_hw,
+        )
+    return type(base_dataset)(**kwargs)
+
+def _resolve_split_indices(samples, config):
+    if config.split_mode == "train_val":
+        train_idx, val_idx = stratified_train_val_split(samples, train_ratio=config.train_ratio, seed=config.seed)
+        test_idx = []
+    else:
+        train_idx, val_idx, test_idx = stratified_split(samples, train_ratio=config.train_ratio, seed=config.seed)
+
+    if not config.use_predefined_split:
+        return train_idx, val_idx, test_idx
+
+    split_to_idx = defaultdict(list)
+    for idx, sample in enumerate(samples):
+        split = ""
+        if sample.metadata is not None:
+            split = str(sample.metadata.get("split", "")).lower().strip()
+        split_to_idx[split].append(idx)
+
+    predefined_train = split_to_idx.get("train", [])
+    predefined_val = split_to_idx.get("val", []) + split_to_idx.get("valid", [])
+    predefined_test = split_to_idx.get("test", [])
+
+    if config.split_mode == "train_val":
+        if predefined_train and predefined_val:
+            print("  Using metadata predefined split (train/val)")
+            return predefined_train, predefined_val, []
+        print("  Predefined split unavailable for train_val; fallback to stratified split")
+        return train_idx, val_idx, test_idx
+
+    if predefined_train and (predefined_val or predefined_test):
+        print("  Using metadata predefined split")
+        return predefined_train, predefined_val, predefined_test
+
+    print("  Predefined split unavailable; fallback to stratified split")
+    return train_idx, val_idx, test_idx
 
 # ---------------------------------------------------------------------------
 # 主函数
@@ -453,6 +606,7 @@ def main():
     parser.add_argument("--class-mode", type=str, default="multiclass", choices=["binary", "multiclass"])
     parser.add_argument("--binary-task", type=str, default="malignant_vs_normal")
     parser.add_argument("--split-mode", type=str, default="train_val_test", choices=["train_val_test", "train_val"])
+    parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--use-predefined-split", action="store_true")
     parser.add_argument("--selection-metric", type=str, default="balanced_accuracy")
 
@@ -518,26 +672,28 @@ def main():
                         help="每个类别的 focal gamma，如 --focal-gammas 2.0 3.0 2.0")
 
     args = parser.parse_args()
+    args.dataset_type = _parse_dataset_type(args.dataset_type)
+    config = _build_config(args)
 
     # 自动启用 3D
     auto_3d = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny",
                "densenet3d", "densenet3d_121", "attention3d_cnn"}
-    if args.backbone in auto_3d:
-        args.use_3d_input = True
+    if config.backbone in auto_3d:
+        config.use_3d_input = True
 
-    set_seed(args.seed)
-    output_dir = Path(args.output_dir)
+    set_seed(config.seed)
+    output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
+    device = torch.device("cpu" if config.cpu or not torch.cuda.is_available() else "cuda")
     print(f"Device: {device}")
 
     # ---- 数据 ----
     print("\nLoading dataset...")
-    ds = _build_dataset(args)
+    ds = _build_dataset(config)
     samples = ds.get_samples()
     samples, class_names = remap_samples_by_class_mode(
-        samples, class_mode=args.class_mode, binary_task=args.binary_task
+        samples, class_mode=config.class_mode, binary_task=config.binary_task
     )
     num_classes = len(class_names)
     print(f"  Samples: {len(samples)}, Classes: {num_classes} ({class_names})")
@@ -549,23 +705,21 @@ def main():
         print(f"    {class_names[lbl]}: {label_counts[lbl]}")
 
     # 划分
-    split_col = None
-    if args.use_predefined_split and args.dataset_type == DatasetType.INTRANET_CT:
-        split_col = "CT_train_val_split"
-    train_idx, val_idx, test_idx = stratified_split(
-        samples, args.split_mode, split_col=split_col, seed=args.seed
-    )
+    train_idx, val_idx, test_idx = _resolve_split_indices(samples, config)
     print(f"  Split: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx) if test_idx else 0}")
 
-    train_tf, val_tf = _build_transforms(args)
-    train_ds = Subset(type(ds)(samples=[samples[i] for i in train_idx], transform=train_tf), range(len(train_idx)))
-    val_ds = Subset(type(ds)(samples=[samples[i] for i in val_idx], transform=val_tf), range(len(val_idx)))
+    train_tf, val_tf = _build_transforms(config)
+    train_base = _build_dataset_from_samples(ds, [samples[i] for i in train_idx], train_tf, config)
+    val_base = _build_dataset_from_samples(ds, [samples[i] for i in val_idx], val_tf, config)
+    train_ds = Subset(train_base, range(len(train_idx)))
+    val_ds = Subset(val_base, range(len(val_idx)))
     test_ds = None
     if test_idx:
-        test_ds = Subset(type(ds)(samples=[samples[i] for i in test_idx], transform=val_tf), range(len(test_idx)))
+        test_base = _build_dataset_from_samples(ds, [samples[i] for i in test_idx], val_tf, config)
+        test_ds = Subset(test_base, range(len(test_idx)))
 
     # 采样器
-    if args.sampling_strategy == "weighted":
+    if config.sampling_strategy == "weighted":
         train_labels = [samples[i].label for i in train_idx]
         class_sample_counts = [max(1, train_labels.count(c)) for c in range(num_classes)]
         weights_per_class = [1.0 / c for c in class_sample_counts]
@@ -576,61 +730,61 @@ def main():
         sampler = None
         shuffle = True
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=shuffle,
-                              sampler=sampler, num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=shuffle,
+                              sampler=sampler, num_workers=config.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False,
+                            num_workers=config.num_workers, pin_memory=True)
     test_loader = None
     if test_ds:
-        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
-                                 num_workers=args.num_workers, pin_memory=True)
+        test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False,
+                                 num_workers=config.num_workers, pin_memory=True)
 
     # ---- 模型 ----
-    print(f"\nBuilding HierarchicalMultiTaskClassifier (backbone={args.backbone})...")
+    print(f"\nBuilding HierarchicalMultiTaskClassifier (backbone={config.backbone})...")
     model = HierarchicalMultiTaskClassifier(
-        backbone_name=args.backbone,
+        backbone_name=config.backbone,
         num_classes=num_classes,
-        pretrained=args.pretrained,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
+        pretrained=config.pretrained,
+        hidden_dim=config.hidden_dim,
+        dropout=config.dropout,
     ).to(device)
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # ---- 损失 ----
     class_weights = None
-    if args.class_weight_strategy != "none":
+    if config.class_weight_strategy != "none":
         counts = [label_counts[c] for c in range(num_classes)]
-        class_weights = build_class_weights(counts, strategy=args.class_weight_strategy,
-                                            effective_num_beta=args.effective_num_beta)
+        class_weights = build_class_weights(counts, strategy=config.class_weight_strategy,
+                                            effective_num_beta=config.effective_num_beta)
         if class_weights is not None:
             class_weights = class_weights.to(device)
             print(f"  Class weights: {class_weights.tolist()}")
 
     criterion = HierarchicalMultiTaskLoss(
         class_weights=class_weights,
-        label_smoothing=args.label_smoothing,
-        weight_abnormal=args.weight_abnormal,
-        weight_main=args.weight_main,
-        weight_benign_malignant=args.weight_benign_malignant,
-        focal_gammas=args.focal_gammas,
+        label_smoothing=config.label_smoothing,
+        weight_abnormal=config.weight_abnormal,
+        weight_main=config.weight_main,
+        weight_benign_malignant=config.weight_benign_malignant,
+        focal_gammas=config.focal_gammas,
     )
     loss_desc = "hierarchical"
-    if args.focal_gammas:
-        loss_desc += f"+class_specific_focal(gammas={args.focal_gammas})"
-    print(f"  Loss: {loss_desc} (w_abnormal={args.weight_abnormal}, w_main={args.weight_main}, w_bm={args.weight_benign_malignant})")
+    if config.focal_gammas:
+        loss_desc += f"+class_specific_focal(gammas={config.focal_gammas})"
+    print(f"  Loss: {loss_desc} (w_abnormal={config.weight_abnormal}, w_main={config.weight_main}, w_bm={config.weight_benign_malignant})")
 
     # ---- 优化器 & 调度器 ----
-    optimizer = create_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
-    scheduler, step_per_batch = create_scheduler(args.scheduler, optimizer, args.epochs, len(train_loader))
+    optimizer = create_optimizer(config.optimizer, model.parameters(), config.lr, config.weight_decay)
+    scheduler, step_per_batch = create_scheduler(config.scheduler, optimizer, config.epochs, len(train_loader))
 
     # ---- 训练循环 ----
-    selection_metric = resolve_selection_metric(args.selection_metric, num_classes)
-    ca_ft_start = args.ca_ft_start if args.ca_ft_start is not None else int(args.epochs * 0.6)
-    print(f"\nTraining for {args.epochs} epochs, selection_metric={selection_metric}")
-    if args.bm_mixup:
-        print(f"  BM-Mixup: enabled (alpha={args.bm_mixup_alpha})")
-    if args.ca_ft:
-        print(f"  Confusion-Aware FT: enabled (start_epoch={ca_ft_start}, boost={args.ca_ft_boost})")
+    selection_metric = resolve_selection_metric(config.selection_metric, num_classes)
+    ca_ft_start = config.ca_ft_start if config.ca_ft_start is not None else int(config.epochs * 0.6)
+    print(f"\nTraining for {config.epochs} epochs, selection_metric={selection_metric}")
+    if config.bm_mixup:
+        print(f"  BM-Mixup: enabled (alpha={config.bm_mixup_alpha})")
+    if config.ca_ft:
+        print(f"  Confusion-Aware FT: enabled (start_epoch={ca_ft_start}, boost={config.ca_ft_boost})")
     print("-" * 60)
 
     best_score = -1.0
@@ -639,14 +793,14 @@ def main():
     start_time = time.time()
     confusion_weights = None  # 混淆感知权重，按需计算
 
-    for epoch in range(args.epochs):
+    for epoch in range(config.epochs):
         epoch_start = time.time()
 
         # 混淆感知微调：到达 start epoch 时计算混淆权重
-        if args.ca_ft and epoch == ca_ft_start and confusion_weights is None:
+        if config.ca_ft and epoch == ca_ft_start and confusion_weights is None:
             print(f"\n  >>> Computing confusion weights at epoch {epoch+1}...")
             confusion_weights = _compute_confusion_weights(
-                model, val_loader, device, num_classes, boost_factor=args.ca_ft_boost
+                model, val_loader, device, num_classes, boost_factor=config.ca_ft_boost
             )
             confusion_weights = confusion_weights.to(device)
 
@@ -657,10 +811,10 @@ def main():
                 confusion_weights=confusion_weights,
                 scheduler=scheduler, scheduler_step_per_batch=step_per_batch,
             )
-        elif args.bm_mixup:
+        elif config.bm_mixup:
             train_loss = train_epoch_hierarchical_mixup(
                 model, train_loader, device, criterion, optimizer,
-                mixup_alpha=args.bm_mixup_alpha,
+                mixup_alpha=config.bm_mixup_alpha,
                 scheduler=scheduler, scheduler_step_per_batch=step_per_batch,
             )
         else:
@@ -671,12 +825,20 @@ def main():
             scheduler.step()
 
         val_metrics = evaluate_hierarchical(model, val_loader, device, criterion, class_names)
-        val_score = resolve_selection_score(val_metrics, selection_metric)
+        val_score, used_metric = resolve_selection_score(val_metrics, selection_metric)
         elapsed = time.time() - epoch_start
 
-        epoch_log = build_epoch_log(
-            epoch, train_loss, val_metrics, val_score, selection_metric, elapsed
-        )
+        epoch_payload = {
+            "loss": train_loss,
+            "val_loss": val_metrics.get("loss"),
+            **{k: v for k, v in val_metrics.items() if k != "loss"},
+            "selection_score": val_score,
+            "selection_metric_used": used_metric,
+            "epoch": epoch,
+            "elapsed_sec": elapsed,
+        }
+        epoch_log = build_epoch_log(epoch_payload)
+        epoch_log.update({"epoch": epoch, "selection_score": val_score, "elapsed_sec": elapsed})
         history.append(epoch_log)
         status = ""
 
@@ -687,7 +849,7 @@ def main():
             status = " *best"
 
         ca_tag = " [CA-FT]" if confusion_weights is not None else ""
-        print(f"  Epoch {epoch+1:3d}/{args.epochs} | train_loss={train_loss:.4f} | "
+        print(f"  Epoch {epoch+1:3d}/{config.epochs} | train_loss={train_loss:.4f} | "
               f"val_loss={val_metrics.get('loss', 0):.4f} | val_acc={val_metrics.get('accuracy', 0):.4f} | "
               f"val_bacc={val_metrics.get('balanced_accuracy', 0):.4f} | "
               f"{selection_metric}={val_score:.4f} | {elapsed:.1f}s{status}{ca_tag}")

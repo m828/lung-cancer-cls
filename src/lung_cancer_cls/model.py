@@ -471,6 +471,12 @@ class HierarchicalMultiTaskClassifier(nn.Module):
         else:
             self.backbone = base_model
 
+        # Remove classifier heads so backbone returns features.
+        if hasattr(self.backbone, "fc") and isinstance(self.backbone.fc, nn.Module):
+            self.backbone.fc = nn.Identity()
+        if hasattr(self.backbone, "classifier") and isinstance(self.backbone.classifier, nn.Module):
+            self.backbone.classifier = nn.Identity()
+
         # 探测 backbone 输出维度
         feat_dim = self._infer_feature_dim(backbone_name)
 
@@ -530,6 +536,9 @@ class HierarchicalMultiTaskClassifier(nn.Module):
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.backbone(x)
+        if feat.dim() == 2:
+            # Some backbones already return pooled [N, C] vectors.
+            return self.backbone_proj[2:](feat)
         return self.backbone_proj(feat)
 
     def forward(self, x: torch.Tensor):

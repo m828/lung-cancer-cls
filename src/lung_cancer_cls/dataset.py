@@ -649,7 +649,20 @@ class IntranetCTDataset(BaseCTDataset):
             raise ValueError(f"Unknown intranet_source: {source}")
 
         if not samples:
-            raise RuntimeError("No valid intranet CT samples discovered")
+            metadata_csv = Path(kwargs.get("metadata_csv", root / "多模态统一检索表_CT本地路径_CT划分.csv"))
+            ct_root = Path(kwargs.get("ct_root", root))
+            nm_path = Path(kwargs.get("bundle_nm_path", root / "processed/NM_all.npy"))
+            bn_path = Path(kwargs.get("bundle_bn_path", root / "processed/BN_all.npy"))
+            mt_path = Path(kwargs.get("bundle_mt_path", root / "processed/MT_all.npy"))
+            raise RuntimeError(
+                "No valid intranet CT samples discovered. "
+                f"source={source}; metadata_csv={metadata_csv} (exists={metadata_csv.exists()}); "
+                f"ct_root={ct_root} (exists={ct_root.exists()}); "
+                f"bundle_nm_path={nm_path} (exists={nm_path.exists()}); "
+                f"bundle_bn_path={bn_path} (exists={bn_path.exists()}); "
+                f"bundle_mt_path={mt_path} (exists={mt_path.exists()}). "
+                "Please verify metadata columns (CT_numpy_cloud路径/样本类型) and file paths."
+            )
         return cls(samples, use_3d=use_3d, depth_size=depth_size, volume_hw=volume_hw)
 
     @classmethod

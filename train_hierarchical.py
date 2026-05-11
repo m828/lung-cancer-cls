@@ -224,6 +224,56 @@ def train_epoch_hierarchical(
     return running_loss / max(seen, 1)
 
 
+
+def _weighted_soft_cross_entropy(
+    logits: torch.Tensor,
+    soft_targets: torch.Tensor,
+    class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Cross entropy for probabilistic targets, with optional per-class weights."""
+    log_probs = F.log_softmax(logits, dim=1)
+    loss = -(soft_targets * log_probs)
+    if class_weights is not None:
+        loss = loss * class_weights.view(1, -1).to(logits.device)
+    return loss.sum(dim=1).mean()
+
+
+def hierarchical_bm_mixup_loss(
+    model_output: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    lam: torch.Tensor,
+    criterion: nn.Module,
+) -> torch.Tensor:
+    """Soft-label hierarchical loss for benign-malignant Mixup samples.
+
+    Mixed samples are always non-healthy for Head A, while Head B and Head C
+    receive probability targets according to the sampled benign proportion ``lam``.
+    """
+    logits_main, logits_abnormal, logits_bm = model_output
+    lam = lam.to(logits_main.device).float().clamp(0.0, 1.0)
+    n_mix = logits_main.size(0)
+
+    main_targets = torch.zeros(n_mix, logits_main.size(1), device=logits_main.device)
+    main_targets[:, 1] = lam
+    main_targets[:, 2] = 1.0 - lam
+
+    abnormal_targets = torch.zeros(n_mix, 2, device=logits_abnormal.device)
+    abnormal_targets[:, 1] = 1.0
+
+    bm_targets = torch.zeros(n_mix, 2, device=logits_bm.device)
+    bm_targets[:, 0] = lam
+    bm_targets[:, 1] = 1.0 - lam
+
+    ce_main = getattr(criterion, "ce_main", None)
+    class_weights = getattr(ce_main, "weight", None)
+    loss_main = _weighted_soft_cross_entropy(logits_main, main_targets, class_weights)
+    loss_abnormal = _weighted_soft_cross_entropy(logits_abnormal, abnormal_targets)
+    loss_bm = _weighted_soft_cross_entropy(logits_bm, bm_targets)
+
+    w_ab = getattr(criterion, "w_abnormal", 1.0)
+    w_main = getattr(criterion, "w_main", 1.0)
+    w_bm = getattr(criterion, "w_bm", 1.0)
+    return w_ab * loss_abnormal + w_main * loss_main + w_bm * loss_bm
+
 def train_epoch_hierarchical_mixup(
     model: nn.Module,
     loader: DataLoader,
@@ -239,7 +289,10 @@ def train_epoch_hierarchical_mixup(
     每个 batch：
       1. 正常前向 + 多任务损失
       2. 找出良性(1)和恶性(2)样本，随机配对做 Mixup
-      3. 混合样本过模型，用原始标签计算附加损失
+      3. 混合样本过模型，用 soft target 计算附加损失：
+         - Head B 三分类目标为 [0, lam, 1-lam]
+         - Head A 始终为非健康
+         - Head C 良/恶目标为 [lam, 1-lam]
       4. 两部分损失合并反传
     """
     model.train()
@@ -272,10 +325,9 @@ def train_epoch_hierarchical_mixup(
                 lam = lam.unsqueeze(-1)  # [n_mix,1,1,1,1] for 3D
 
             x_mix = lam * x[perm_b] + (1 - lam) * x[perm_m]
-            y_mix = y[perm_b]  # 用良性标签（主标签）
 
             outputs_mix = model(x_mix)
-            loss_mix = criterion(outputs_mix, y_mix)
+            loss_mix = hierarchical_bm_mixup_loss(outputs_mix, lam.view(-1), criterion)
 
             loss = loss + loss_mix
 
@@ -615,7 +667,8 @@ def main():
                         choices=["simple", "resnet18", "resnet18_se", "resnet18_cbam",
                                  "efficientnet_b0", "convnext_tiny", "resnet3d18",
                                  "mc3_18", "r2plus1d_18", "swin3d_tiny",
-                                 "densenet3d", "densenet3d_121", "attention3d_cnn"])
+                                 "densenet3d", "densenet3d_121", "densenet121",
+                                 "densenet3d121", "attention3d_cnn"])
     parser.add_argument("--pretrained", action="store_true")
     parser.add_argument("--use-3d-input", action="store_true")
     parser.add_argument("--depth-size", type=int, default=128)
@@ -677,7 +730,8 @@ def main():
 
     # 自动启用 3D
     auto_3d = {"resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny",
-               "densenet3d", "densenet3d_121", "attention3d_cnn"}
+               "densenet3d", "densenet3d_121", "densenet121", "densenet3d121",
+               "attention3d_cnn"}
     if config.backbone in auto_3d:
         config.use_3d_input = True
 

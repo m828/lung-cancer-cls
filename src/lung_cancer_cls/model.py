@@ -429,6 +429,20 @@ class DenseNet3DCTClassifier(nn.Module):
         x = self.head(x).flatten(1)
         return self.classifier(x)
 
+
+
+def _normalize_model_name(model_name: str) -> str:
+    """Normalize public backbone aliases to the internal model factory names."""
+    name = model_name.lower().strip()
+    aliases = {
+        "densenet121": "densenet3d_121",
+        "densenet3d121": "densenet3d_121",
+        "densenet-121": "densenet3d_121",
+        "densenet3d-121": "densenet3d_121",
+    }
+    return aliases.get(name, name)
+
+
 class DenseNet3D_121(nn.Module):
     """Monai DenseNet121 3D用于CT体数据分类"""
     def __init__(self, num_classes: int = 3):
@@ -464,6 +478,7 @@ class HierarchicalMultiTaskClassifier(nn.Module):
         dropout: float = 0.3,
     ):
         super().__init__()
+        backbone_name = _normalize_model_name(backbone_name)
         # 共享 backbone（去掉原始分类头）
         base_model = build_model(backbone_name, num_classes=3, pretrained=pretrained)
         if hasattr(base_model, "backbone"):
@@ -471,14 +486,12 @@ class HierarchicalMultiTaskClassifier(nn.Module):
         else:
             self.backbone = base_model
 
-        # Remove classifier heads so backbone returns features.
-        if hasattr(self.backbone, "fc") and isinstance(self.backbone.fc, nn.Module):
-            self.backbone.fc = nn.Identity()
-        if hasattr(self.backbone, "classifier") and isinstance(self.backbone.classifier, nn.Module):
-            self.backbone.classifier = nn.Identity()
-
         # 探测 backbone 输出维度
         feat_dim = self._infer_feature_dim(backbone_name)
+
+        # Remove classifier heads so backbone returns features.
+        self._strip_classifier_heads(self.backbone, expected_feature_dim=feat_dim)
+
 
         self.backbone_proj = nn.Sequential(
             nn.AdaptiveAvgPool3d(1) if self._is_3d(backbone_name) else nn.AdaptiveAvgPool2d(1),
@@ -515,7 +528,44 @@ class HierarchicalMultiTaskClassifier(nn.Module):
         self._hidden_dim = hidden_dim
 
     @staticmethod
+    def _strip_classifier_heads(backbone: nn.Module, expected_feature_dim: int) -> None:
+        """Remove final classifier layers while preserving backbone feature pooling.
+
+        MONAI DenseNet stores ``relu -> pool -> flatten -> out`` in ``class_layers``.
+        Replacing the whole ``class_layers`` module makes the network return a 5D
+        feature map, but some MONAI versions still return the final 3-class logits
+        if the head is not stripped correctly.  Replacing only the final Linear
+        layer preserves the 1024-D pooled feature vector expected by the
+        hierarchical projection layer.
+        """
+        if hasattr(backbone, "fc") and isinstance(backbone.fc, nn.Module):
+            backbone.fc = nn.Identity()
+        if hasattr(backbone, "classifier") and isinstance(backbone.classifier, nn.Module):
+            backbone.classifier = nn.Identity()
+
+        class_layers = getattr(backbone, "class_layers", None)
+        if isinstance(class_layers, nn.Sequential):
+            children = list(class_layers.named_children())
+            for child_name, child_module in reversed(children):
+                if isinstance(child_module, nn.Linear):
+                    if child_module.in_features != expected_feature_dim:
+                        raise ValueError(
+                            "Unexpected MONAI DenseNet classifier input dimension: "
+                            f"got {child_module.in_features}, expected {expected_feature_dim}"
+                        )
+                    class_layers._modules[child_name] = nn.Identity()
+                    return
+        elif isinstance(class_layers, nn.Linear):
+            if class_layers.in_features != expected_feature_dim:
+                raise ValueError(
+                    "Unexpected classifier input dimension: "
+                    f"got {class_layers.in_features}, expected {expected_feature_dim}"
+                )
+            backbone.class_layers = nn.Identity()
+
+    @staticmethod
     def _is_3d(backbone_name: str) -> bool:
+        backbone_name = _normalize_model_name(backbone_name)
         return backbone_name in {
             "resnet3d18", "mc3_18", "r2plus1d_18", "swin3d_tiny",
             "densenet3d", "densenet3d_121", "attention3d_cnn",
@@ -523,6 +573,7 @@ class HierarchicalMultiTaskClassifier(nn.Module):
 
     @staticmethod
     def _infer_feature_dim(backbone_name: str) -> int:
+        backbone_name = _normalize_model_name(backbone_name)
         dim_map = {
             "simple": 128, "resnet18": 512, "resnet18_se": 512,
             "resnet18_cbam": 512, "efficientnet_b0": 1280,
@@ -538,6 +589,13 @@ class HierarchicalMultiTaskClassifier(nn.Module):
         feat = self.backbone(x)
         if feat.dim() == 2:
             # Some backbones already return pooled [N, C] vectors.
+            expected_dim = self.backbone_proj[2].in_features
+            if feat.size(1) != expected_dim:
+                raise RuntimeError(
+                    "Backbone returned a 2D tensor with an unexpected feature dimension: "
+                    f"got {feat.size(1)}, expected {expected_dim}. "
+                    "This usually means the backbone classifier head was not removed correctly."
+                )
             return self.backbone_proj[2:](feat)
         return self.backbone_proj(feat)
 
@@ -554,7 +612,7 @@ class HierarchicalMultiTaskClassifier(nn.Module):
 
 def build_model(model_name: str, num_classes: int = 3, pretrained: bool = False) -> nn.Module:
     """模型工厂，便于脚本化组合和消融。"""
-    name = model_name.lower().strip()
+    name = _normalize_model_name(model_name)
 
     if name == "simple":
         return SimpleCTClassifier(num_classes=num_classes)

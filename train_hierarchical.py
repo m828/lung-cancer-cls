@@ -622,14 +622,23 @@ def _resolve_split_indices(samples, config):
     predefined_test = split_to_idx.get("test", [])
 
     if config.split_mode == "train_val":
-        if predefined_train and predefined_val:
-            print("  Using metadata predefined split (train/val)")
-            return predefined_train, predefined_val, []
+        if predefined_train and (predefined_val or predefined_test):
+            eval_idx = predefined_val + predefined_test
+            if predefined_val and predefined_test:
+                print("  Using metadata predefined val+test split as validation")
+            elif predefined_test:
+                print("  Using metadata predefined train/test split as train/val")
+            else:
+                print("  Using metadata predefined split (train/val)")
+            return predefined_train, eval_idx, []
         print("  Predefined split unavailable for train_val; fallback to stratified split")
         return train_idx, val_idx, test_idx
 
     if predefined_train and (predefined_val or predefined_test):
-        print("  Using metadata predefined split")
+        if not predefined_val and predefined_test:
+            print("  Using metadata predefined train/test split; validation set is empty")
+        else:
+            print("  Using metadata predefined split")
         return predefined_train, predefined_val, predefined_test
 
     print("  Predefined split unavailable; fallback to stratified split")

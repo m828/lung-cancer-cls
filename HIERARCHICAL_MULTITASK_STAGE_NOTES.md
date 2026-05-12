@@ -443,6 +443,13 @@ python3 -m lung_cancer_cls.train \
     --seed 42
 ```
 
+
+### 4.10 与既有两阶段脚本保持划分一致
+
+既有 `train_ft.py + eval_cot_0416.py` 流程使用 CSV 中已有的标签/文本划分，常见表现为 `train=1021, test=280`。层次化脚本如果使用 `--split-mode train_val --use-predefined-split`，现在会优先读取 CSV 中的划分列；当 CSV 只有 `train/test` 而没有 `val` 时，会把 `test` 集作为验证集使用；如果 CSV 中同时残留 `val` 和 `test`，会在 `train_val` 模式下把二者合并为验证集，从而避免漏掉部分旧测试样本，并与旧两阶段评估的 280 例保持一致。
+
+如果 CSV 没有可识别的划分列，脚本才会回退到按 `--train-ratio 0.8` 重新分层划分，此时 1301 例会变成 `train=1040, val=261`。
+
 ## 5. 其他已提出但未实现的方法
 
 ### 5.1 Confusion-Aware Fine-tuning — ✅ 已实现

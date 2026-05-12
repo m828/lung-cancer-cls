@@ -82,6 +82,69 @@ ALIASES = {
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
+def normalize_split_name(value: Any) -> str:
+    """Normalize common English/Chinese split labels to train/val/test."""
+    text = str(value).strip().lower()
+    if not text or text in {"nan", "none", "pandasnan", "null"}:
+        return ""
+    text = text.replace(" ", "").replace("_", "").replace("-", "")
+    mapping = {
+        "train": "train",
+        "training": "train",
+        "trainset": "train",
+        "tr": "train",
+        "训练": "train",
+        "训练集": "train",
+        "val": "val",
+        "valid": "val",
+        "validation": "val",
+        "validset": "val",
+        "valset": "val",
+        "验证": "val",
+        "验证集": "val",
+        "test": "test",
+        "testset": "test",
+        "testing": "test",
+        "测试": "test",
+        "测试集": "test",
+    }
+    if text in mapping:
+        return mapping[text]
+    if "train" in text or "训练" in text:
+        return "train"
+    if "val" in text or "valid" in text or "验证" in text:
+        return "val"
+    if "test" in text or "测试" in text:
+        return "test"
+    return text
+
+
+def infer_split_column(columns: Sequence[str], preferred: str | None = None) -> str | None:
+    """Infer the metadata split column used by intranet CSV files."""
+    if preferred and preferred in columns:
+        return preferred
+    candidates = [
+        "CT_train_val_split",
+        "split",
+        "train_val_split",
+        "dataset_split",
+        "数据划分",
+        "数据集划分",
+        "标签划分",
+        "文本划分",
+        "CT划分",
+        "CT_train_test_split",
+        "train_test_split",
+    ]
+    for column in candidates:
+        if column in columns:
+            return column
+    for column in columns:
+        lowered = str(column).lower()
+        if "split" in lowered or "划分" in str(column):
+            return column
+    return None
+
 def canonicalize_class_name(name: str) -> str | None:
     return ALIASES.get(name.strip().lower())
 
@@ -121,7 +184,7 @@ def _load_predefined_split_rows(
         key = str(row[key_col])
         metadata: Dict[str, Any] = {
             "sample_id": str(row["sample_id"]),
-            "split": str(row["split"]).lower().strip(),
+            "split": normalize_split_name(row["split"]),
         }
         for column in ["fold", "patient_id", "nodule_id", "class_name", "relative_path"]:
             if column in split_df.columns and not pd.isna(row[column]):
@@ -681,6 +744,7 @@ class IntranetCTDataset(BaseCTDataset):
             return []
 
         df = pd.read_csv(metadata_csv).fillna("PANDASNAN")
+        resolved_split_col = infer_split_column(list(df.columns), preferred=split_col)
         samples: List[Sample] = []
         for _, row in df.iterrows():
             label_name = str(row.get(label_col, "")).strip()
@@ -694,7 +758,7 @@ class IntranetCTDataset(BaseCTDataset):
             ct_path = ct_root / rel_path
             if not ct_path.exists():
                 continue
-            split = str(row.get(split_col, "")).strip().lower()
+            split = normalize_split_name(row.get(resolved_split_col, "")) if resolved_split_col else ""
             samples.append(Sample(image_path=ct_path, label=label, metadata={"split": split} if split else None))
         return samples
 

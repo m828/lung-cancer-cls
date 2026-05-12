@@ -79,7 +79,7 @@ L = w_abnormal * L_A + w_main * L_B + w_bm * L_C
 
 `HierarchicalMultiTaskClassifier`:
 
-- 共享 backbone（支持 resnet3d18, densenet3d_121, swin3d_tiny 等）
+- 共享 backbone（支持 resnet3d18, densenet3d_121 / densenet121, swin3d_tiny 等）
 - `backbone_proj`: AdaptiveAvgPool3d → Flatten → Linear → ReLU → Dropout
 - `head_abnormal`: Linear → ReLU → Dropout → Linear(→2) — Task A
 - `head_main`: Linear → ReLU → Dropout → Linear(→num_classes) — Task B
@@ -91,8 +91,8 @@ L = w_abnormal * L_A + w_main * L_B + w_bm * L_C
 
 - 仅对良性(label=1)和恶性(label=2)样本进行 Mixup
 - 使用 Beta(α,α) 分布采样混合比例 λ
-- 混合后标签取良性侧（保守策略）
-- 与层次化多任务损失叠加使用
+- 混合后使用 soft target，而不是硬指定为良性：Head B 三分类目标为 `[0, λ, 1-λ]`，Head C 良恶性目标为 `[λ, 1-λ]`，Head A 始终为非健康
+- 与层次化多任务损失叠加使用，避免把混合样本全部推向良性造成标签偏置
 
 ### 3.5 Class-Specific Focal Loss (`--focal-gammas`)
 
@@ -372,13 +372,42 @@ python3 train_hierarchical.py \
     --seed 42
 ```
 
-### 4.8 DenseNet3D-121 backbone（可选替换）
+### 4.8 DenseNet121 / DenseNet3D-121 backbone（推荐对照）
 
-将上述脚本中的 `--backbone resnet3d18` 替换为：
+可以把上述脚本中的 `--backbone resnet3d18` 替换为 DenseNet121 3D 版本：
 
 ```bash
-    --backbone densenet3d_121 \
+    --backbone densenet121 \
     --hidden-dim 512 \
+```
+
+`densenet121` 是 `densenet3d_121` 的别名，二者等价。该 backbone 依赖 MONAI；如内网环境缺少 MONAI，需要先安装 `monai`。层次化模型会保留 MONAI DenseNet 的 relu/pool/flatten 特征汇聚层，仅移除最后的 Linear 分类层，使三任务 head 接收 1024 维 DenseNet 特征。
+
+建议先跑一个稳定版对照：不加 Mixup、不加强 class weight，降低辅助任务权重，确认主三分类能正常收敛后再逐步加 benign 优化策略。
+
+```bash
+python3 train_hierarchical.py \
+    --dataset-type intranet_ct \
+    --data-root "$CT_ROOT" \
+    --metadata-csv "$METADATA_CSV" \
+    --ct-root "$CT_ROOT" \
+    --output-dir "${OUTPUT_BASE}/hierarchical_densenet121_stable" \
+    --backbone densenet121 \
+    --use-3d-input \
+    --depth-size 128 \
+    --volume-hw 256 \
+    --class-mode multiclass \
+    --split-mode train_val_test \
+    --epochs 40 \
+    --batch-size 2 \
+    --lr 1e-4 \
+    --scheduler cosine \
+    --aug-profile basic \
+    --class-weight-strategy none \
+    --selection-metric accuracy \
+    --weight-main 1.0 \
+    --weight-abnormal 0.3 \
+    --weight-benign-malignant 0.5
 ```
 
 ### 4.9 实验对照：直接三分类 baseline
@@ -413,6 +442,13 @@ python3 -m lung_cancer_cls.train \
     --selection-metric balanced_accuracy \
     --seed 42
 ```
+
+
+### 4.10 与既有两阶段脚本保持划分一致
+
+既有 `train_ft.py + eval_cot_0416.py` 流程使用 CSV 中已有的标签/文本划分，常见表现为 `train=1021, test=280`。层次化脚本如果使用 `--split-mode train_val --use-predefined-split`，现在会优先读取 CSV 中的划分列；当 CSV 只有 `train/test` 而没有 `val` 时，会把 `test` 集作为验证集使用；如果 CSV 中同时残留 `val` 和 `test`，会在 `train_val` 模式下把二者合并为验证集，从而避免漏掉部分旧测试样本，并与旧两阶段评估的 280 例保持一致。
+
+如果 CSV 没有可识别的划分列，脚本才会回退到按 `--train-ratio 0.8` 重新分层划分，此时 1301 例会变成 `train=1040, val=261`。
 
 ## 5. 其他已提出但未实现的方法
 

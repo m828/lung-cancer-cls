@@ -919,18 +919,26 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
         predefined_test = split_to_idx.get("test", [])
 
         if config.split_mode == "train_val":
-            if predefined_train and predefined_val:
+            if predefined_train and (predefined_val or predefined_test):
                 train_idx = predefined_train
-                val_idx = predefined_val
+                val_idx = predefined_val + predefined_test
+                if predefined_val and predefined_test:
+                    print("使用 metadata 预定义 val+test 划分作为验证集")
+                elif predefined_test:
+                    print("使用 metadata 预定义 train/test 划分作为 train/val")
+                else:
+                    print("使用 metadata 预定义划分（train/val）")
                 test_idx = []
-                print("使用 metadata 预定义划分（train/val）")
             else:
                 print("预定义 train/val 划分不可用，回退为分层划分")
         elif predefined_train and (predefined_val or predefined_test):
             train_idx = predefined_train
             val_idx = predefined_val
             test_idx = predefined_test
-            print("使用 metadata 预定义划分")
+            if not predefined_val and predefined_test:
+                print("使用 metadata 预定义 train/test 划分（val 为空）")
+            else:
+                print("使用 metadata 预定义划分")
         else:
             print("预定义划分不可用，回退为统一分层划分")
     if config.split_mode == "train_val":

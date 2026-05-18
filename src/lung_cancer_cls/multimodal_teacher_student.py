@@ -88,6 +88,7 @@ class MultiModalTrainConfig:
     cpu: bool = False
     ct_model: str = "resnet3d18"
     pretrained: bool = False
+    direct_ct_classifier: bool = False
     use_3d_input: bool = True
     depth_size: int = 32
     volume_hw: int = 128
@@ -727,6 +728,38 @@ class SafeBatchNorm1d(nn.BatchNorm1d):
         return super().forward(input)
 
 
+class DirectCTClassifierWrapper(nn.Module):
+    """For CT-only experiments: use the CT backbone as a direct classifier."""
+
+    def __init__(self, ct_model: str, num_classes: int, pretrained: bool = False):
+        super().__init__()
+        self.modalities = ("ct",)
+        self.ct_encoder = build_model(
+            ct_model,
+            num_classes=num_classes,
+            pretrained=pretrained,
+        )
+
+        # keep these attributes for metrics / compatibility
+        self.ct_feature_dim = int(num_classes)
+        self.text_feature_dim = 0
+        self.gene_feature_dim = 0
+        self.fusion_hidden_dim = 0
+        self.fusion_input_dim = int(num_classes)
+
+    def forward(self, inputs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.ct_encoder(inputs["ct"])
+
+    def forward_outputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        logits = self.forward(inputs)
+        return {
+            "logits": logits,
+            "fused_input": logits,
+            "fused": logits,
+            "modal_features": {"ct": logits},
+        }
+
+
 class FlexibleMultiModalClassifier(nn.Module):
     def __init__(
         self,
@@ -1252,6 +1285,16 @@ def create_model_from_config(
     feature_info: Dict[str, Any],
     class_names: Dict[int, str],
 ) -> FlexibleMultiModalClassifier:
+    if (
+        getattr(config, "direct_ct_classifier", False)
+        and normalize_modalities(config.modalities) == ("ct",)
+    ):
+        return DirectCTClassifierWrapper(
+            ct_model=config.ct_model,
+            num_classes=len(class_names),
+            pretrained=config.pretrained,
+        )
+
     return FlexibleMultiModalClassifier(
         modalities=config.modalities,
         num_classes=len(class_names),
@@ -1868,6 +1911,11 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--ct-model", type=str, default="resnet3d18", help="CT backbone name from the existing model registry.")
     parser.add_argument("--pretrained", action="store_true")
+    parser.add_argument(
+        "--direct-ct-classifier",
+        action="store_true",
+        help="For modalities=ct only, use CT backbone as a direct classifier without fusion head.",
+    )
     parser.add_argument("--disable-3d-input", action="store_true", help="Use 2D middle-slice CT input instead of 3D volume input.")
     parser.add_argument("--depth-size", type=int, default=32)
     parser.add_argument("--volume-hw", type=int, default=128)
@@ -1975,6 +2023,7 @@ def parse_train_args() -> MultiModalTrainConfig:
         cpu=args.cpu,
         ct_model=args.ct_model,
         pretrained=args.pretrained,
+        direct_ct_classifier=args.direct_ct_classifier,
         use_3d_input=not args.disable_3d_input,
         depth_size=args.depth_size,
         volume_hw=args.volume_hw,
@@ -2040,6 +2089,7 @@ def parse_student_args() -> StudentKDConfig:
         cpu=args.cpu,
         ct_model=args.ct_model,
         pretrained=args.pretrained,
+        direct_ct_classifier=args.direct_ct_classifier,
         use_3d_input=not args.disable_3d_input,
         depth_size=args.depth_size,
         volume_hw=args.volume_hw,

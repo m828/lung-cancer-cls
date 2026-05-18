@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import pickle
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,21 @@ DEFAULT_NUMERIC_HINTS = [
     "性别",
 ]
 
+DEFAULT_FORBIDDEN_FEATURE_KEYWORDS = [
+    "样本类型",
+    "label",
+    "label_3class",
+    "诊断",
+    "病理",
+    "出院诊断",
+    "疾病类型",
+    "良恶性",
+    "肺癌",
+    "恶性",
+    "malignant",
+    "benign",
+]
+
 GENDER_MAP = {
     "男": 1.0,
     "女": 0.0,
@@ -72,6 +88,11 @@ class TextClinicalFeatureConfig:
     text_cols: str | None = None
     numeric_cols: str | None = None
     text_cache_tsv: Path | None = None
+    strict_no_leakage: bool = False
+    disable_text_numeric_features: bool = False
+    allowed_text_cols: str | None = None
+    allowed_numeric_cols: str | None = None
+    forbidden_feature_keywords: str | None = None
 
 
 def _parse_optional_list(raw: str | None) -> List[str] | None:
@@ -79,6 +100,49 @@ def _parse_optional_list(raw: str | None) -> List[str] | None:
         return None
     values = [item.strip() for item in str(raw).split(",") if item.strip()]
     return values or None
+
+
+def parse_forbidden_feature_keywords(raw: str | None = None) -> List[str]:
+    custom = _parse_optional_list(raw)
+    if custom is None:
+        return list(DEFAULT_FORBIDDEN_FEATURE_KEYWORDS)
+    merged: List[str] = []
+    for keyword in list(DEFAULT_FORBIDDEN_FEATURE_KEYWORDS) + list(custom):
+        if keyword not in merged:
+            merged.append(keyword)
+    return merged
+
+
+def _matches_forbidden_keyword(name: str, keywords: Sequence[str]) -> bool:
+    lowered = str(name).lower()
+    return any(str(keyword).lower() in lowered for keyword in keywords if str(keyword).strip())
+
+
+def filter_forbidden_columns(
+    columns: Sequence[str],
+    keywords: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    allowed: List[str] = []
+    blocked: List[str] = []
+    for col in columns:
+        if _matches_forbidden_keyword(str(col), keywords):
+            blocked.append(str(col))
+        else:
+            allowed.append(str(col))
+    return allowed, blocked
+
+
+def _resolve_allowed_columns(
+    df: pd.DataFrame,
+    raw_allowed: str | None,
+    raw_legacy: str | None = None,
+) -> List[str] | None:
+    values = _parse_optional_list(raw_allowed)
+    if values is None:
+        values = _parse_optional_list(raw_legacy)
+    if values is None:
+        return None
+    return [col for col in values if col in df.columns]
 
 
 def _sanitize_name(name: str) -> str:
@@ -128,6 +192,138 @@ def infer_numeric_columns(
     return numeric_cols
 
 
+class TextNumericPreprocessor:
+    """Train-split-fitted preprocessing for text numeric columns."""
+
+    def __init__(
+        self,
+        input_columns: Sequence[str],
+        output_prefix: str = "num__",
+        variance_threshold: float = 1e-6,
+        clip_sigma: float = 3.0,
+    ):
+        self.input_columns = [str(col) for col in input_columns]
+        self.output_prefix = str(output_prefix)
+        self.variance_threshold = float(variance_threshold)
+        self.clip_sigma = float(clip_sigma)
+        self.imputer = SimpleImputer(strategy="median")
+        self.selector = VarianceThreshold(threshold=self.variance_threshold)
+        self.scaler = StandardScaler()
+        self.active_input_columns_: List[str] = []
+        self.clip_mean_: np.ndarray | None = None
+        self.clip_std_: np.ndarray | None = None
+        self.selected_input_columns_: List[str] = []
+        self.output_columns_: List[str] = []
+        self.fitted_ = False
+
+    def _coerce_frame(self, df: pd.DataFrame, columns: Sequence[str] | None = None) -> pd.DataFrame:
+        columns = list(columns if columns is not None else self.input_columns)
+        frame = pd.DataFrame(index=df.index)
+        for col in columns:
+            if col in df.columns:
+                series = df[col]
+            else:
+                series = pd.Series([np.nan] * len(df), index=df.index)
+            if "性别" in str(col):
+                series = _coerce_gender(series)
+            frame[col] = pd.to_numeric(series, errors="coerce")
+        return frame
+
+    def fit(self, train_df: pd.DataFrame) -> "TextNumericPreprocessor":
+        if not self.input_columns:
+            self.selected_input_columns_ = []
+            self.output_columns_ = []
+            self.fitted_ = True
+            return self
+        full_num_df = self._coerce_frame(train_df, self.input_columns)
+        self.active_input_columns_ = [
+            col for col in self.input_columns
+            if col in full_num_df.columns and full_num_df[col].notna().any()
+        ]
+        if not self.active_input_columns_:
+            self.selected_input_columns_ = []
+            self.output_columns_ = []
+            self.fitted_ = True
+            return self
+        num_df = full_num_df[self.active_input_columns_]
+        values = self.imputer.fit_transform(num_df)
+        clipped = values.astype(np.float32, copy=True)
+        self.clip_mean_ = np.mean(clipped, axis=0).astype(np.float32)
+        self.clip_std_ = np.std(clipped, axis=0).astype(np.float32)
+        for col_idx in range(clipped.shape[1]):
+            std = float(self.clip_std_[col_idx])
+            if std > 0:
+                mean = float(self.clip_mean_[col_idx])
+                clipped[:, col_idx] = np.clip(
+                    clipped[:, col_idx],
+                    mean - self.clip_sigma * std,
+                    mean + self.clip_sigma * std,
+                )
+        try:
+            selected = self.selector.fit_transform(clipped)
+            support = self.selector.get_support()
+        except ValueError:
+            self.selected_input_columns_ = []
+            self.output_columns_ = []
+            self.fitted_ = True
+            return self
+        self.selected_input_columns_ = [
+            self.active_input_columns_[idx] for idx, keep in enumerate(support) if bool(keep)
+        ]
+        self.output_columns_ = [
+            f"{self.output_prefix}{_sanitize_name(col)}" for col in self.selected_input_columns_
+        ]
+        if selected.size > 0 and selected.shape[1] > 0:
+            self.scaler.fit(selected)
+        self.fitted_ = True
+        return self
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.fitted_:
+            raise RuntimeError("TextNumericPreprocessor must be fitted before transform.")
+        if not self.active_input_columns_ or not self.output_columns_:
+            return pd.DataFrame(index=df.index)
+        if self.clip_mean_ is None or self.clip_std_ is None:
+            raise RuntimeError("Missing clipping statistics.")
+        num_df = self._coerce_frame(df, self.active_input_columns_)
+        values = self.imputer.transform(num_df).astype(np.float32, copy=True)
+        for col_idx in range(values.shape[1]):
+            std = float(self.clip_std_[col_idx])
+            if std > 0:
+                mean = float(self.clip_mean_[col_idx])
+                values[:, col_idx] = np.clip(
+                    values[:, col_idx],
+                    mean - self.clip_sigma * std,
+                    mean + self.clip_sigma * std,
+                )
+        selected = self.selector.transform(values)
+        if selected.size == 0 or selected.shape[1] == 0:
+            return pd.DataFrame(index=df.index)
+        scaled = self.scaler.transform(selected).astype(np.float32)
+        return pd.DataFrame(scaled, columns=self.output_columns_, index=df.index)
+
+    def fit_transform(self, train_df: pd.DataFrame) -> pd.DataFrame:
+        self.fit(train_df)
+        return self.transform(train_df)
+
+    def to_metadata(self) -> Dict[str, Any]:
+        return {
+            "type": "TextNumericPreprocessor",
+            "fit_scope": "train_only",
+            "input_columns": list(self.input_columns),
+            "active_input_columns": list(self.active_input_columns_),
+            "selected_input_columns": list(self.selected_input_columns_),
+            "output_columns": list(self.output_columns_),
+            "variance_threshold": self.variance_threshold,
+            "clip_sigma": self.clip_sigma,
+        }
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+
 def _merge_text_csvs(config: TextClinicalFeatureConfig) -> pd.DataFrame:
     if config.text_feature_tsv is not None:
         return pd.read_csv(config.text_feature_tsv, sep="\t")
@@ -152,6 +348,36 @@ def _merge_text_csvs(config: TextClinicalFeatureConfig) -> pd.DataFrame:
     df[config.record_id_col] = df[config.record_id_col].astype(str).str.strip()
     df = df.loc[df[config.record_id_col] != ""].drop_duplicates(subset=[config.record_id_col], keep="first")
     return df.reset_index(drop=True)
+
+
+def summarize_health_disease_source_columns(
+    text_health_csv: Path | None,
+    text_disease_csv: Path | None,
+) -> Dict[str, Any]:
+    if text_health_csv is None or text_disease_csv is None:
+        return {}
+    if not Path(text_health_csv).exists() or not Path(text_disease_csv).exists():
+        return {}
+    df_health = pd.read_csv(text_health_csv)
+    df_disease = pd.read_csv(text_disease_csv)
+    health_cols = set(str(col) for col in df_health.columns)
+    disease_cols = set(str(col) for col in df_disease.columns)
+    union_cols = sorted(health_cols | disease_cols)
+    df = pd.concat(
+        [
+            df_health.reindex(columns=union_cols, fill_value=np.nan),
+            df_disease.reindex(columns=union_cols, fill_value=np.nan),
+        ],
+        axis=0,
+        ignore_index=True,
+    )
+    return {
+        "only_in_health_cols": sorted(health_cols - disease_cols),
+        "only_in_disease_cols": sorted(disease_cols - health_cols),
+        "union_missing_rate": {
+            col: float(df[col].isna().mean()) for col in union_cols
+        },
+    }
 
 
 def _combine_text(df: pd.DataFrame, text_cols: Sequence[str]) -> List[str]:
@@ -249,6 +475,105 @@ def _build_numeric_feature_frame(
     return pd.DataFrame(scaled, columns=out_cols, index=df.index), out_cols
 
 
+def _split_masks(df: pd.DataFrame, split_col: str = "assigned_split") -> Dict[str, pd.Series]:
+    if split_col not in df.columns:
+        return {"all": pd.Series([True] * len(df), index=df.index)}
+    splits = df[split_col].fillna("").astype(str).str.lower()
+    return {
+        split: splits.eq(split)
+        for split in ["train", "val", "test"]
+    }
+
+
+def column_missing_rates_by_split(
+    df: pd.DataFrame,
+    columns: Sequence[str],
+    split_col: str = "assigned_split",
+) -> Dict[str, Dict[str, float]]:
+    masks = _split_masks(df, split_col=split_col)
+    out: Dict[str, Dict[str, float]] = {}
+    for col in columns:
+        if col not in df.columns:
+            continue
+        out[col] = {}
+        for split, mask in masks.items():
+            denom = int(mask.sum())
+            out[col][split] = float(df.loc[mask, col].isna().mean()) if denom else float("nan")
+    return out
+
+
+def text_length_stats_by_split(
+    df: pd.DataFrame,
+    text_cols: Sequence[str],
+    split_col: str = "assigned_split",
+) -> Dict[str, Dict[str, float]]:
+    masks = _split_masks(df, split_col=split_col)
+    if text_cols:
+        text_values = df[list(text_cols)].fillna("").apply(
+            lambda row: " ".join(str(value) for value in row.tolist()),
+            axis=1,
+        )
+    else:
+        text_values = pd.Series([""] * len(df), index=df.index)
+    lengths = text_values.astype(str).map(len)
+    stats: Dict[str, Dict[str, float]] = {}
+    for split, mask in masks.items():
+        values = lengths.loc[mask].astype(float)
+        if values.empty:
+            stats[split] = {"mean": float("nan"), "std": float("nan"), "median": float("nan"), "p25": float("nan"), "p75": float("nan")}
+            continue
+        stats[split] = {
+            "mean": float(values.mean()),
+            "std": float(values.std(ddof=0)),
+            "median": float(values.median()),
+            "p25": float(values.quantile(0.25)),
+            "p75": float(values.quantile(0.75)),
+        }
+    return stats
+
+
+def missing_rate_warnings(
+    missing_rates: Mapping[str, Mapping[str, float]],
+    max_diff: float = 0.4,
+) -> List[str]:
+    warnings: List[str] = []
+    for col, by_split in missing_rates.items():
+        values = [
+            float(value)
+            for value in by_split.values()
+            if value is not None and not pd.isna(value)
+        ]
+        if len(values) >= 2 and max(values) - min(values) > max_diff:
+            warnings.append(
+                f"Column `{col}` has large split missing-rate gap: "
+                f"min={min(values):.3f}, max={max(values):.3f}."
+            )
+    return warnings
+
+
+def write_text_feature_audit(
+    output_dir: Path,
+    audit: Dict[str, Any],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "text_feature_audit.json").write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for kind, section in [
+        ("numeric", audit.get("numeric_missing_rate_by_split", {})),
+        ("text", audit.get("text_missing_rate_by_split", {})),
+    ]:
+        for col, by_split in section.items():
+            row = {"kind": kind, "column": col}
+            row.update(by_split)
+            rows.append(row)
+    if rows:
+        pd.DataFrame(rows).to_csv(output_dir / "text_feature_audit.csv", index=False, encoding="utf-8-sig")
+
+
 def prepare_text_feature_table(
     config: TextClinicalFeatureConfig,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -259,6 +584,18 @@ def prepare_text_feature_table(
         out_df = pd.read_csv(config.text_feature_tsv, sep="\t")
         if config.record_id_col not in out_df.columns:
             raise ValueError(f"record_id_col not found in text feature TSV: {config.record_id_col}")
+        keywords = parse_forbidden_feature_keywords(config.forbidden_feature_keywords)
+        high_risk_cols = [
+            col for col in out_df.columns
+            if col != config.record_id_col and _matches_forbidden_keyword(str(col), keywords)
+        ]
+        if high_risk_cols and config.strict_no_leakage:
+            raise ValueError(
+                "High-risk columns were found in precomputed text_feature_tsv under strict mode: "
+                + ", ".join(high_risk_cols)
+            )
+        if high_risk_cols:
+            out_df = out_df.drop(columns=high_risk_cols)
         out_df = out_df.dropna(subset=[config.record_id_col]).copy()
         out_df[config.record_id_col] = out_df[config.record_id_col].astype(str).str.strip()
         out_df = out_df.loc[out_df[config.record_id_col] != ""].drop_duplicates(subset=[config.record_id_col], keep="first")
@@ -278,6 +615,10 @@ def prepare_text_feature_table(
         if src_meta_path.exists():
             meta = json.loads(src_meta_path.read_text(encoding="utf-8"))
             meta["copied_from"] = str(config.text_feature_tsv)
+        meta["forbidden_feature_keywords"] = list(keywords)
+        meta["high_risk_columns"] = list(high_risk_cols)
+        meta["num_output_cols"] = [col for col in out_df.columns if str(col).startswith("num__")]
+        meta["bert_dim"] = int(sum(1 for col in out_df.columns if str(col).startswith("bert_")))
         meta_path = config.output_tsv.with_suffix(config.output_tsv.suffix + ".meta.json")
         meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return out_df.reset_index(drop=True), meta
@@ -286,9 +627,11 @@ def prepare_text_feature_table(
     if config.record_id_col not in df.columns:
         raise ValueError(f"record_id_col not found: {config.record_id_col}")
 
-    explicit_text_cols = _parse_optional_list(config.text_cols)
-    explicit_numeric_cols = _parse_optional_list(config.numeric_cols)
+    keywords = parse_forbidden_feature_keywords(config.forbidden_feature_keywords)
+    explicit_text_cols = _resolve_allowed_columns(df, config.allowed_text_cols, config.text_cols)
+    explicit_numeric_cols = _resolve_allowed_columns(df, config.allowed_numeric_cols, config.numeric_cols)
     text_cols = infer_text_columns(df, explicit_cols=explicit_text_cols)
+    text_cols, blocked_text_cols = filter_forbidden_columns(text_cols, keywords)
     numeric_cols = infer_numeric_columns(
         df,
         record_id_col=config.record_id_col,
@@ -296,6 +639,14 @@ def prepare_text_feature_table(
         text_cols=text_cols,
         explicit_cols=explicit_numeric_cols,
     )
+    numeric_cols, blocked_numeric_cols = filter_forbidden_columns(numeric_cols, keywords)
+    if config.disable_text_numeric_features:
+        numeric_cols = []
+    if config.strict_no_leakage and (blocked_text_cols or blocked_numeric_cols):
+        raise ValueError(
+            "High-risk text/numeric feature columns were blocked under strict mode: "
+            + ", ".join(blocked_text_cols + blocked_numeric_cols)
+        )
     combined_texts = _combine_text(df, text_cols)
 
     numeric_frame, numeric_output_cols = _build_numeric_feature_frame(df, numeric_cols)
@@ -337,6 +688,18 @@ def prepare_text_feature_table(
         "num_input_cols": list(numeric_cols),
         "num_output_cols": list(numeric_output_cols),
         "text_cols": list(text_cols),
+        "blocked_text_cols": list(blocked_text_cols),
+        "blocked_numeric_cols": list(blocked_numeric_cols),
+        "forbidden_feature_keywords": list(keywords),
+        "numeric_preprocessing": {
+            "fit_scope": "full_table_legacy_prepare_text_features",
+            "strict_train_only": False,
+            "disabled": bool(config.disable_text_numeric_features),
+        },
+        "source_column_audit": summarize_health_disease_source_columns(
+            config.text_health_csv,
+            config.text_disease_csv,
+        ),
         "bert_dim": int(embedding_matrix.shape[1]),
         "embedding_backend": backend,
         "num_rows": int(len(out_df)),
@@ -382,6 +745,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-cols", type=str, default=None, help="Optional comma-separated explicit text columns.")
     parser.add_argument("--numeric-cols", type=str, default=None, help="Optional comma-separated explicit numeric columns.")
     parser.add_argument("--text-cache-tsv", type=Path, default=None, help="Optional prepared TSV cache to reuse before rebuilding.")
+    parser.add_argument("--strict-no-leakage", action="store_true", help="Fail when high-risk feature columns are detected.")
+    parser.add_argument("--disable-text-numeric-features", action="store_true", help="Do not export numeric text-clinical features.")
+    parser.add_argument("--allowed-text-cols", type=str, default=None, help="Comma-separated text columns allowed for BERT/hash embedding.")
+    parser.add_argument("--allowed-numeric-cols", type=str, default=None, help="Comma-separated numeric columns allowed for text numeric features.")
+    parser.add_argument(
+        "--forbidden-feature-keywords",
+        type=str,
+        default=None,
+        help="Comma-separated high-risk column-name keywords to block from text/numeric features.",
+    )
     return parser
 
 
@@ -402,6 +775,11 @@ def parse_args() -> TextClinicalFeatureConfig:
         text_cols=args.text_cols,
         numeric_cols=args.numeric_cols,
         text_cache_tsv=args.text_cache_tsv,
+        strict_no_leakage=args.strict_no_leakage,
+        disable_text_numeric_features=args.disable_text_numeric_features,
+        allowed_text_cols=args.allowed_text_cols,
+        allowed_numeric_cols=args.allowed_numeric_cols,
+        forbidden_feature_keywords=args.forbidden_feature_keywords,
     )
 
 

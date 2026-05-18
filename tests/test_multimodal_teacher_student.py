@@ -1,9 +1,11 @@
 from pathlib import Path
 import json
+import pickle
 import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,10 +17,14 @@ from lung_cancer_cls.multimodal_teacher_student import (
     MultiModalTrainConfig,
     StudentKDConfig,
     TextClinicalEncoder,
+    apply_text_feature_safety_after_split,
+    build_multimodal_cohort,
     normalize_distill_methods,
     parse_distillation_method_weights,
+    split_cohort,
     train_multimodal_model,
     train_student_kd,
+    validate_patient_split_integrity,
 )
 
 
@@ -283,6 +289,153 @@ def test_multimodal_teacher_student_smoke(tmp_path: Path):
     assert "train_kd_attention_loss" in history_row
     assert "train_kd_ct_loss" in history_row
     assert "train_kd_text_loss" in history_row
+
+
+def test_strict_no_leakage_rejects_forbidden_text_feature_column(tmp_path: Path):
+    meta_csv = tmp_path / "meta.csv"
+    text_tsv = tmp_path / "text.tsv"
+    pd.DataFrame(
+        [
+            {"SampleID": "S0", "record_id": "R0", "样本类型": "健康对照", "CT_train_val_split": "train"},
+            {"SampleID": "S1", "record_id": "R1", "样本类型": "肺癌", "CT_train_val_split": "val"},
+        ]
+    ).to_csv(meta_csv, index=False)
+    pd.DataFrame(
+        [
+            {"record_id": "R0", "label": 0, "bert_0000": 0.0, "bert_0001": 0.1},
+            {"record_id": "R1", "label": 1, "bert_0000": 0.2, "bert_0001": 0.3},
+        ]
+    ).to_csv(text_tsv, sep="\t", index=False)
+
+    with pytest.raises(ValueError, match="High-risk columns"):
+        build_multimodal_cohort(
+            MultiModalTrainConfig(
+                data_root=tmp_path,
+                metadata_csv=meta_csv,
+                output_dir=tmp_path / "strict_bad",
+                modalities=("text",),
+                text_feature_tsv=text_tsv,
+                use_predefined_split=True,
+                strict_no_leakage=True,
+            ),
+            ("text",),
+        )
+
+
+def test_patient_id_cross_split_raises_in_strict_mode(tmp_path: Path):
+    meta_csv = tmp_path / "meta.csv"
+    text_tsv = tmp_path / "text.tsv"
+    pd.DataFrame(
+        [
+            {"SampleID": "S0", "record_id": "R0", "patient_id": "P0", "样本类型": "健康对照", "CT_train_val_split": "train"},
+            {"SampleID": "S1", "record_id": "R1", "patient_id": "P0", "样本类型": "肺癌", "CT_train_val_split": "test"},
+            {"SampleID": "S2", "record_id": "R2", "patient_id": "P1", "样本类型": "健康对照", "CT_train_val_split": "val"},
+        ]
+    ).to_csv(meta_csv, index=False)
+    pd.DataFrame(
+        [
+            {"record_id": "R0", "bert_0000": 0.0},
+            {"record_id": "R1", "bert_0000": 0.2},
+            {"record_id": "R2", "bert_0000": 0.4},
+        ]
+    ).to_csv(text_tsv, sep="\t", index=False)
+    config = MultiModalTrainConfig(
+        data_root=tmp_path,
+        metadata_csv=meta_csv,
+        output_dir=tmp_path / "patient_bad",
+        modalities=("text",),
+        text_feature_tsv=text_tsv,
+        use_predefined_split=True,
+        patient_id_col="patient_id",
+        strict_no_leakage=True,
+    )
+    cohort, _, _, _ = build_multimodal_cohort(config, ("text",))
+    train_idx, val_idx, test_idx, _ = split_cohort(cohort, config)
+    with pytest.raises(ValueError, match="Patient-level split leakage"):
+        validate_patient_split_integrity(
+            cohort,
+            train_idx,
+            val_idx,
+            test_idx,
+            "patient_id",
+            strict=True,
+        )
+
+
+def test_disable_text_numeric_features_empties_text_num_cols(tmp_path: Path):
+    ct_root, meta_csv, _, text_tsv = _write_tiny_multimodal_fixture(tmp_path)
+    metrics = train_multimodal_model(
+        MultiModalTrainConfig(
+            data_root=tmp_path,
+            metadata_csv=meta_csv,
+            output_dir=tmp_path / "text_no_num",
+            modalities=("text",),
+            text_feature_tsv=text_tsv,
+            use_predefined_split=True,
+            epochs=1,
+            batch_size=2,
+            num_workers=0,
+            cpu=True,
+            text_feature_dim=8,
+            fusion_hidden_dim=8,
+            disable_text_numeric_features=True,
+            save_predictions=False,
+        )
+    )
+    assert metrics["modality_feature_dims"]["text_num"] == 0
+    assert metrics["feature_info"]["text_num_cols"] == []
+    assert (tmp_path / "text_no_num" / "text_feature_audit.json").exists()
+
+
+def test_text_numeric_preprocessor_fits_train_split_only(tmp_path: Path):
+    meta_csv = tmp_path / "meta.csv"
+    text_tsv = tmp_path / "text_raw.tsv"
+    pd.DataFrame(
+        [
+            {"SampleID": "S0", "record_id": "R0", "样本类型": "健康对照", "CT_train_val_split": "train"},
+            {"SampleID": "S1", "record_id": "R1", "样本类型": "肺癌", "CT_train_val_split": "train"},
+            {"SampleID": "S2", "record_id": "R2", "样本类型": "健康对照", "CT_train_val_split": "val"},
+            {"SampleID": "S3", "record_id": "R3", "样本类型": "肺癌", "CT_train_val_split": "test"},
+        ]
+    ).to_csv(meta_csv, index=False)
+    pd.DataFrame(
+        [
+            {"record_id": "R0", "年龄": 10.0, "bert_0000": 0.0},
+            {"record_id": "R1", "年龄": 20.0, "bert_0000": 0.2},
+            {"record_id": "R2", "年龄": 1000.0, "bert_0000": 0.4},
+            {"record_id": "R3", "年龄": 30.0, "bert_0000": 0.6},
+        ]
+    ).to_csv(text_tsv, sep="\t", index=False)
+    config = MultiModalTrainConfig(
+        data_root=tmp_path,
+        metadata_csv=meta_csv,
+        output_dir=tmp_path / "train_only_num",
+        modalities=("text",),
+        text_feature_tsv=text_tsv,
+        use_predefined_split=True,
+        allowed_numeric_cols="年龄",
+        text_feature_dim=8,
+        fusion_hidden_dim=8,
+    )
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    cohort, feature_info, _, _ = build_multimodal_cohort(config, ("text",))
+    train_idx, val_idx, test_idx, _ = split_cohort(cohort, config)
+    cohort, feature_info, warnings = apply_text_feature_safety_after_split(
+        config,
+        cohort,
+        feature_info,
+        train_idx,
+        val_idx,
+        test_idx,
+    )
+    assert warnings == []
+    assert feature_info["text_num_cols"] == ["num__年龄"]
+    assert (config.output_dir / "text_numeric_preprocessor.pkl").exists()
+    with open(config.output_dir / "text_numeric_preprocessor.pkl", "rb") as f:
+        preprocessor = pickle.load(f)
+    assert preprocessor.to_metadata()["fit_scope"] == "train_only"
+    val_value = float(cohort.iloc[val_idx[0]]["num__年龄"])
+    assert val_value == pytest.approx(3.0, abs=1e-5)
 
 
 def test_distillation_method_helpers():

@@ -19,9 +19,19 @@ from lung_cancer_cls.cnv_xgboost import load_gene_feature_table, resolve_label_c
 from lung_cancer_cls.dataset import INTRANET_LABEL_MAP, get_default_transforms, get_default_volume_transforms
 from lung_cancer_cls.model import build_model
 from lung_cancer_cls.text_clinical import (
+    DEFAULT_FORBIDDEN_FEATURE_KEYWORDS,
     TextClinicalFeatureConfig,
+    TextNumericPreprocessor,
+    column_missing_rates_by_split,
+    filter_forbidden_columns,
+    infer_numeric_columns,
     load_text_feature_table,
+    missing_rate_warnings,
+    parse_forbidden_feature_keywords,
     prepare_text_feature_table,
+    summarize_health_disease_source_columns,
+    text_length_stats_by_split,
+    write_text_feature_audit,
 )
 from lung_cancer_cls.train import (
     build_epoch_log,
@@ -71,10 +81,16 @@ class MultiModalTrainConfig:
     text_cache_tsv: Path | None = None
     label_col: str = "样本类型"
     metadata_sample_id_col: str = "SampleID"
+    patient_id_col: str | None = None
     metadata_text_id_col: str = "record_id"
     split_col: str = "CT_train_val_split"
     ct_path_col: str = "CT_numpy_cloud路径"
     text_record_id_col: str = "record_id"
+    strict_no_leakage: bool = False
+    disable_text_numeric_features: bool = False
+    allowed_text_cols: str | None = None
+    allowed_numeric_cols: str | None = None
+    forbidden_feature_keywords: str | None = None
     gene_id_col: str | None = None
     gene_label_col: str | None = None
     class_mode: str = "binary"
@@ -243,6 +259,13 @@ def _format_metric(value: float | None) -> str:
     return "nan" if value is None else f"{value:.4f}"
 
 
+def _parse_cli_list(raw: str | None) -> List[str] | None:
+    if raw is None:
+        return None
+    values = [item.strip() for item in str(raw).split(",") if item.strip()]
+    return values or None
+
+
 def infer_run_family(modalities: Sequence[str], is_student: bool = False) -> str:
     normalized = normalize_modalities(modalities)
     if is_student:
@@ -304,6 +327,99 @@ def _safe_split(
     return list(train_idx), list(holdout_idx)
 
 
+def _group_label_items(
+    cohort: pd.DataFrame,
+    indices: Sequence[int],
+    group_col: str,
+) -> Tuple[List[str], np.ndarray]:
+    group_items: List[Tuple[str, int]] = []
+    subset = cohort.iloc[list(indices)]
+    for group_id, group in subset.groupby(group_col, sort=False):
+        labels = group["label"].astype(int).tolist()
+        if not labels:
+            continue
+        counts = pd.Series(labels).value_counts()
+        group_items.append((str(group_id), int(counts.index[0])))
+    groups = [item[0] for item in group_items]
+    labels = np.asarray([item[1] for item in group_items], dtype=np.int64)
+    return groups, labels
+
+
+def _safe_group_split(
+    cohort: pd.DataFrame,
+    indices: Sequence[int],
+    group_col: str,
+    test_size: float,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
+    if not indices:
+        return [], []
+    groups, group_labels = _group_label_items(cohort, indices, group_col)
+    if len(groups) <= 1:
+        return list(indices), []
+    unique_labels, counts = np.unique(group_labels, return_counts=True)
+    kwargs = {
+        "test_size": test_size,
+        "random_state": seed,
+        "shuffle": True,
+    }
+    if len(unique_labels) > 1 and counts.min() >= 2:
+        kwargs["stratify"] = group_labels
+    try:
+        train_groups, holdout_groups = train_test_split(groups, **kwargs)
+    except ValueError:
+        train_groups, holdout_groups = train_test_split(
+            groups,
+            test_size=test_size,
+            random_state=seed,
+            shuffle=True,
+        )
+    train_group_set = set(str(group) for group in train_groups)
+    holdout_group_set = set(str(group) for group in holdout_groups)
+    train_idx = [
+        idx for idx in indices
+        if str(cohort.iloc[idx][group_col]) in train_group_set
+    ]
+    holdout_idx = [
+        idx for idx in indices
+        if str(cohort.iloc[idx][group_col]) in holdout_group_set
+    ]
+    return train_idx, holdout_idx
+
+
+def validate_patient_split_integrity(
+    cohort: pd.DataFrame,
+    train_idx: Sequence[int],
+    val_idx: Sequence[int],
+    test_idx: Sequence[int],
+    patient_id_col: str | None,
+    strict: bool = False,
+) -> List[str]:
+    if not patient_id_col or patient_id_col not in cohort.columns:
+        return []
+    split_by_patient: Dict[str, set[str]] = {}
+    for split_name, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
+        for idx in indices:
+            patient_id = str(cohort.iloc[idx][patient_id_col]).strip()
+            if not patient_id:
+                continue
+            split_by_patient.setdefault(patient_id, set()).add(split_name)
+    leaked = {
+        patient_id: sorted(splits)
+        for patient_id, splits in split_by_patient.items()
+        if len(splits) > 1
+    }
+    if not leaked:
+        return []
+    message = (
+        "Patient-level split leakage detected: "
+        + "; ".join(f"{pid}={','.join(splits)}" for pid, splits in sorted(leaked.items())[:20])
+    )
+    if strict:
+        raise ValueError(message)
+    return [message]
+
+
 def load_or_prepare_text_table(
     config: MultiModalTrainConfig,
 ) -> Tuple[pd.DataFrame, List[str], List[str], Dict[str, Any], Path]:
@@ -325,6 +441,11 @@ def load_or_prepare_text_table(
         record_id_col=config.text_record_id_col,
         label_col=config.label_col,
         text_cache_tsv=cache_path if cache_path.exists() else None,
+        strict_no_leakage=config.strict_no_leakage,
+        disable_text_numeric_features=config.disable_text_numeric_features,
+        allowed_text_cols=config.allowed_text_cols,
+        allowed_numeric_cols=config.allowed_numeric_cols,
+        forbidden_feature_keywords=config.forbidden_feature_keywords,
     )
     prepare_text_feature_table(feature_config)
     df, num_cols, bert_cols, meta = load_text_feature_table(cache_path, record_id_col=config.text_record_id_col)
@@ -356,6 +477,10 @@ def build_multimodal_cohort(
             "split": split_series,
         }
     )
+    if config.patient_id_col:
+        if config.patient_id_col not in df_meta.columns:
+            raise ValueError(f"patient_id_col not found in metadata CSV: {config.patient_id_col}")
+        cohort["patient_id"] = df_meta[config.patient_id_col].astype(str).str.strip()
     if config.metadata_text_id_col in df_meta.columns:
         cohort["record_id"] = df_meta[config.metadata_text_id_col].astype(str).str.strip()
     else:
@@ -378,6 +503,8 @@ def build_multimodal_cohort(
         "gene_cols": [],
         "text_num_cols": [],
         "text_emb_cols": [],
+        "text_raw_numeric_cols": [],
+        "text_raw_text_cols": [],
         "text_feature_tsv": None,
     }
     stats: Dict[str, Any] = {
@@ -417,11 +544,53 @@ def build_multimodal_cohort(
         if config.metadata_text_id_col not in df_meta.columns:
             raise ValueError(f"text record id column not found in metadata CSV: {config.metadata_text_id_col}")
         text_df, text_num_cols, text_emb_cols, text_meta, text_path = load_or_prepare_text_table(config)
-        feature_info["text_num_cols"] = list(text_num_cols)
+        keywords = parse_forbidden_feature_keywords(config.forbidden_feature_keywords)
+        high_risk_text_table_cols = [
+            col for col in text_df.columns
+            if col != config.text_record_id_col and any(
+                str(keyword).lower() in str(col).lower() for keyword in keywords
+            )
+        ]
+        if high_risk_text_table_cols and config.strict_no_leakage:
+            raise ValueError(
+                "High-risk columns were found in text features under strict mode: "
+                + ", ".join(high_risk_text_table_cols)
+            )
+        safe_text_num_cols, blocked_precomputed_num_cols = filter_forbidden_columns(text_num_cols, keywords)
+        text_cols_from_meta = [
+            col for col in text_meta.get("text_cols", [])
+            if col in text_df.columns
+        ] if isinstance(text_meta, dict) else []
+        allowed_numeric = _parse_cli_list(config.allowed_numeric_cols)
+        if allowed_numeric is not None:
+            raw_numeric_cols = [
+                col for col in allowed_numeric
+                if col in text_df.columns and col not in {config.text_record_id_col, *text_num_cols, *text_emb_cols}
+            ]
+        else:
+            candidate_numeric_cols = [
+                col for col in text_df.columns
+                if col not in {config.text_record_id_col, *text_num_cols, *text_emb_cols}
+            ]
+            raw_numeric_cols = infer_numeric_columns(
+                text_df[candidate_numeric_cols + [config.text_record_id_col]].copy() if candidate_numeric_cols else text_df,
+                record_id_col=config.text_record_id_col,
+                label_col=config.label_col,
+                text_cols=text_cols_from_meta,
+                explicit_cols=None,
+            )
+            raw_numeric_cols = [col for col in raw_numeric_cols if col in candidate_numeric_cols]
+        raw_numeric_cols, blocked_raw_numeric_cols = filter_forbidden_columns(raw_numeric_cols, keywords)
+        feature_info["text_num_cols"] = list(safe_text_num_cols)
         feature_info["text_emb_cols"] = list(text_emb_cols)
+        feature_info["text_raw_numeric_cols"] = list(raw_numeric_cols)
+        feature_info["text_raw_text_cols"] = list(text_cols_from_meta)
         feature_info["text_meta"] = text_meta
         feature_info["text_feature_tsv"] = str(text_path)
-        if not text_num_cols and not text_emb_cols:
+        feature_info["text_high_risk_columns"] = list(high_risk_text_table_cols)
+        feature_info["text_blocked_raw_numeric_cols"] = list(blocked_raw_numeric_cols)
+        feature_info["text_blocked_precomputed_num_cols"] = list(blocked_precomputed_num_cols)
+        if not safe_text_num_cols and not text_emb_cols and not raw_numeric_cols:
             raise RuntimeError("Prepared text feature table contains no usable text features.")
         cohort = cohort.merge(
             text_df,
@@ -472,6 +641,7 @@ def split_cohort(
 ) -> Tuple[List[int], List[int], List[int], str]:
     labels = cohort["label"].to_numpy(dtype=np.int64)
     all_indices = list(range(len(cohort)))
+    group_col = "patient_id" if config.patient_id_col and "patient_id" in cohort.columns else None
 
     if config.use_predefined_split:
         splits = cohort["split"].tolist()
@@ -503,6 +673,15 @@ def split_cohort(
             else:
                 train_idx = train_plus_val_idx
         return train_idx, val_idx, test_idx, "predefined"
+
+    if group_col is not None:
+        if config.split_mode == "train_val":
+            train_idx, val_idx = _safe_group_split(cohort, all_indices, group_col, config.val_ratio, config.seed)
+            return train_idx, val_idx, [], "patient_group_random"
+
+        train_val_idx, test_idx = _safe_group_split(cohort, all_indices, group_col, config.test_ratio, config.seed)
+        train_idx, val_idx = _safe_group_split(cohort, train_val_idx, group_col, config.val_ratio, config.seed)
+        return train_idx, val_idx, test_idx, "patient_group_random"
 
     if config.split_mode == "train_val":
         train_idx, val_idx = _safe_split(all_indices, labels, config.val_ratio, config.seed)
@@ -1213,16 +1392,186 @@ def save_split_manifest(
     test_idx: Sequence[int],
 ) -> None:
     frames: List[pd.DataFrame] = []
+    base_cols = ["sample_id", "record_id", "label_name", "label"]
+    if "patient_id" in cohort.columns:
+        base_cols.append("patient_id")
     for split_name, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
         if not indices:
             continue
-        frame = cohort.iloc[list(indices)][["sample_id", "record_id", "label_name", "label"]].copy()
+        frame = cohort.iloc[list(indices)][base_cols].copy()
         frame["assigned_split"] = split_name
         frames.append(frame)
     manifest = pd.concat(frames, axis=0, ignore_index=True) if frames else pd.DataFrame(
-        columns=["sample_id", "record_id", "label_name", "label", "assigned_split"]
+        columns=base_cols + ["assigned_split"]
     )
     manifest.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _with_assigned_split(
+    cohort: pd.DataFrame,
+    train_idx: Sequence[int],
+    val_idx: Sequence[int],
+    test_idx: Sequence[int],
+) -> pd.DataFrame:
+    frame = cohort.copy()
+    frame["assigned_split"] = ""
+    for split_name, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
+        if indices:
+            frame.loc[list(indices), "assigned_split"] = split_name
+    return frame
+
+
+def _text_numeric_meta_is_train_only(text_meta: Dict[str, Any]) -> bool:
+    if not isinstance(text_meta, dict):
+        return False
+    candidates = [
+        text_meta.get("numeric_preprocessing", {}),
+        text_meta.get("text_numeric_preprocessor", {}),
+        text_meta.get("numeric_preprocessor", {}),
+    ]
+    for item in candidates:
+        if isinstance(item, dict) and str(item.get("fit_scope", "")).lower() == "train_only":
+            return True
+    return False
+
+
+def apply_text_feature_safety_after_split(
+    config: MultiModalTrainConfig,
+    cohort: pd.DataFrame,
+    feature_info: Dict[str, Any],
+    train_idx: Sequence[int],
+    val_idx: Sequence[int],
+    test_idx: Sequence[int],
+) -> Tuple[pd.DataFrame, Dict[str, Any], List[str]]:
+    if "text" not in feature_info.get("modalities", []):
+        return cohort, feature_info, []
+
+    warnings: List[str] = []
+    text_meta = feature_info.get("text_meta", {}) if isinstance(feature_info.get("text_meta", {}), dict) else {}
+    precomputed_num_cols = list(feature_info.get("text_num_cols", []))
+    raw_numeric_cols = list(feature_info.get("text_raw_numeric_cols", []))
+    raw_text_cols = list(feature_info.get("text_raw_text_cols", []))
+    text_emb_cols = list(feature_info.get("text_emb_cols", []))
+    high_risk_cols = list(feature_info.get("text_high_risk_columns", []))
+    blocked_raw_numeric_cols = list(feature_info.get("text_blocked_raw_numeric_cols", []))
+    blocked_precomputed_num_cols = list(feature_info.get("text_blocked_precomputed_num_cols", []))
+    source_column_audit = text_meta.get("source_column_audit", {})
+
+    if high_risk_cols:
+        warnings.append(
+            "High-risk text feature table columns detected: " + ", ".join(high_risk_cols)
+        )
+    if blocked_raw_numeric_cols:
+        warnings.append(
+            "High-risk raw numeric columns blocked: " + ", ".join(blocked_raw_numeric_cols)
+        )
+    if blocked_precomputed_num_cols:
+        warnings.append(
+            "High-risk precomputed num__ columns blocked: " + ", ".join(blocked_precomputed_num_cols)
+        )
+    if source_column_audit:
+        only_health = source_column_audit.get("only_in_health_cols", [])
+        only_disease = source_column_audit.get("only_in_disease_cols", [])
+        if only_health or only_disease:
+            warnings.append(
+                "Text source CSVs have side-specific columns; inspect only_in_health_cols/only_in_disease_cols."
+            )
+
+    if config.disable_text_numeric_features:
+        if precomputed_num_cols or raw_numeric_cols:
+            warnings.append("Text numeric features disabled; using only bert_* text embedding columns.")
+        feature_info["text_num_cols"] = []
+        feature_info["text_numeric_preprocessing"] = {"disabled": True}
+    elif raw_numeric_cols:
+        preprocessor = TextNumericPreprocessor(raw_numeric_cols)
+        numeric_frame = preprocessor.fit(cohort.iloc[list(train_idx)]).transform(cohort)
+        if not numeric_frame.empty:
+            for col in numeric_frame.columns:
+                cohort[col] = numeric_frame[col].astype(np.float32)
+        feature_info["text_num_cols"] = list(numeric_frame.columns)
+        feature_info["text_numeric_preprocessing"] = preprocessor.to_metadata()
+        preprocessor_path = config.output_dir / "text_numeric_preprocessor.pkl"
+        preprocessor.save(preprocessor_path)
+        feature_info["text_numeric_preprocessor_path"] = str(preprocessor_path)
+        if precomputed_num_cols:
+            warnings.append(
+                "Precomputed num__ columns were ignored; raw numeric columns were refit on the training split."
+            )
+    elif precomputed_num_cols:
+        if not _text_numeric_meta_is_train_only(text_meta):
+            message = (
+                "Precomputed num__ text numeric features are present, but their preprocessing "
+                "cannot be verified as train-split-only. Use --disable-text-numeric-features "
+                "or provide raw numeric columns for train-only fitting."
+            )
+            if config.strict_no_leakage:
+                raise ValueError(message)
+            warnings.append(message)
+        feature_info["text_numeric_preprocessing"] = {
+            "fit_scope": "precomputed_unknown",
+            "strict_train_only": False,
+        }
+    else:
+        feature_info["text_num_cols"] = []
+        feature_info["text_numeric_preprocessing"] = {"disabled": False, "fit_scope": "none"}
+
+    if config.strict_no_leakage and high_risk_cols:
+        raise ValueError("High-risk text columns detected under strict mode: " + ", ".join(high_risk_cols))
+    if config.strict_no_leakage and source_column_audit:
+        if source_column_audit.get("only_in_health_cols") or source_column_audit.get("only_in_disease_cols"):
+            warnings.append(
+                "Side-specific text source columns detected under strict mode; they are recorded in audit."
+            )
+
+    if not feature_info.get("text_num_cols") and not text_emb_cols:
+        raise RuntimeError("No usable text features remain after text numeric safety filtering.")
+
+    audit_frame = _with_assigned_split(cohort, train_idx, val_idx, test_idx)
+    numeric_missing = column_missing_rates_by_split(
+        audit_frame,
+        raw_numeric_cols or precomputed_num_cols,
+        split_col="assigned_split",
+    )
+    text_missing = column_missing_rates_by_split(
+        audit_frame,
+        raw_text_cols,
+        split_col="assigned_split",
+    )
+    warnings.extend(missing_rate_warnings(numeric_missing))
+    warnings.extend(missing_rate_warnings(text_missing))
+
+    keywords = parse_forbidden_feature_keywords(config.forbidden_feature_keywords)
+    audit = {
+        "text_feature_tsv": feature_info.get("text_feature_tsv"),
+        "text_feature_meta": text_meta,
+        "text_cols": list(raw_text_cols),
+        "numeric_input_columns": list(raw_numeric_cols or text_meta.get("num_input_cols", [])),
+        "numeric_precomputed_columns": list(precomputed_num_cols),
+        "numeric_output_columns": list(feature_info.get("text_num_cols", [])),
+        "bert_columns_count": int(len(text_emb_cols)),
+        "disable_text_numeric_features": bool(config.disable_text_numeric_features),
+        "strict_no_leakage": bool(config.strict_no_leakage),
+        "allowed_text_cols": _parse_cli_list(config.allowed_text_cols),
+        "allowed_numeric_cols": _parse_cli_list(config.allowed_numeric_cols),
+        "forbidden_feature_keywords": list(keywords),
+        "high_risk_columns": list(high_risk_cols),
+        "blocked_raw_numeric_cols": list(blocked_raw_numeric_cols),
+        "blocked_precomputed_num_cols": list(blocked_precomputed_num_cols),
+        "numeric_missing_rate_by_split": numeric_missing,
+        "text_missing_rate_by_split": text_missing,
+        "text_length_stats_by_split": text_length_stats_by_split(audit_frame, raw_text_cols, split_col="assigned_split"),
+        "source_column_audit": source_column_audit or summarize_health_disease_source_columns(
+            config.text_health_csv,
+            config.text_disease_csv,
+        ),
+        "warnings": warnings,
+    }
+    write_text_feature_audit(config.output_dir, audit)
+    (config.output_dir / "leakage_warnings.json").write_text(
+        json.dumps({"warnings": warnings}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return cohort, feature_info, warnings
 
 
 def load_split_manifest_indices(
@@ -1406,6 +1755,23 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
         train_idx, val_idx, test_idx, split_source = split_cohort(cohort, config)
     if not train_idx:
         raise RuntimeError("Training split is empty.")
+    leakage_warnings = validate_patient_split_integrity(
+        cohort,
+        train_idx,
+        val_idx,
+        test_idx,
+        "patient_id" if config.patient_id_col else None,
+        strict=config.strict_no_leakage,
+    )
+    cohort, feature_info, text_warnings = apply_text_feature_safety_after_split(
+        config,
+        cohort,
+        feature_info,
+        train_idx,
+        val_idx,
+        test_idx,
+    )
+    leakage_warnings.extend(text_warnings)
     save_split_manifest(config.output_dir / "split_manifest.csv", cohort, train_idx, val_idx, test_idx)
 
     selection_metric = resolve_selection_metric(config.selection_metric, len(class_names))
@@ -1538,6 +1904,12 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
         },
         "history": history,
         "config": jsonable_dataclass(config),
+        "feature_info": {
+            key: value
+            for key, value in feature_info.items()
+            if key not in {"text_meta"}
+        },
+        "leakage_warnings": leakage_warnings,
     }
     with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1639,6 +2011,14 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
 
     teacher_metrics, teacher_config, teacher_modalities, _ = load_teacher_bundle(config.teacher_run_dir)
     config = inherit_paths_from_teacher(config, teacher_config)
+    teacher_text_num_dim = int(teacher_metrics.get("modality_feature_dims", {}).get("text_num", 0) or 0)
+    if config.disable_text_numeric_features and "text" in teacher_modalities and teacher_text_num_dim > 0:
+        raise ValueError(
+            "The teacher checkpoint was trained with text numeric features "
+            f"(text_num={teacher_text_num_dim}), so --disable-text-numeric-features would "
+            "make the teacher architecture incompatible. Use a teacher trained with the same "
+            "text numeric setting or omit this flag for KD."
+        )
     required_modalities = normalize_modalities(list(teacher_modalities) + list(config.modalities))
     config.distill_methods = validate_distillation_methods(config.modalities, teacher_modalities, config.distill_methods)
     resolved_distill_weights = resolve_distillation_method_weights(
@@ -1672,6 +2052,23 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
 
     if not train_idx:
         raise RuntimeError("Training split is empty after aligning teacher/student cohort.")
+    leakage_warnings = validate_patient_split_integrity(
+        cohort,
+        train_idx,
+        val_idx,
+        test_idx,
+        "patient_id" if config.patient_id_col else None,
+        strict=config.strict_no_leakage,
+    )
+    cohort, feature_info, text_warnings = apply_text_feature_safety_after_split(
+        config,
+        cohort,
+        feature_info,
+        train_idx,
+        val_idx,
+        test_idx,
+    )
+    leakage_warnings.extend(text_warnings)
     save_split_manifest(config.output_dir / "split_manifest.csv", cohort, train_idx, val_idx, test_idx)
 
     selection_metric = resolve_selection_metric(config.selection_metric, len(class_names))
@@ -1860,6 +2257,12 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
         "history": history,
         "config": jsonable_dataclass(config),
         "teacher_config": jsonable_dataclass(teacher_config),
+        "feature_info": {
+            key: value
+            for key, value in feature_info.items()
+            if key not in {"text_meta"}
+        },
+        "leakage_warnings": leakage_warnings,
     }
     with open(config.output_dir / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
@@ -1894,10 +2297,24 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--text-cache-tsv", type=Path, default=None, help="Reusable cached prepared text feature TSV path.")
     parser.add_argument("--label-col", type=str, default="样本类型", help="Metadata label column.")
     parser.add_argument("--metadata-sample-id-col", type=str, default="SampleID", help="Metadata sample ID column.")
+    parser.add_argument("--patient-id-col", type=str, default=None, help="Optional patient/group ID column for patient-level split checks or group split.")
     parser.add_argument("--metadata-text-id-col", type=str, default="record_id", help="Metadata text record ID column.")
     parser.add_argument("--split-col", type=str, default="CT_train_val_split", help="Metadata split column.")
     parser.add_argument("--ct-path-col", type=str, default="CT_numpy_cloud路径", help="Metadata CT relative path column.")
     parser.add_argument("--text-record-id-col", type=str, default="record_id", help="Prepared text feature record ID column.")
+    parser.add_argument("--strict-no-leakage", action="store_true", help="Fail on high-risk text fields, patient split leakage, or unverifiable precomputed num__ features.")
+    parser.add_argument("--disable-text-numeric-features", action="store_true", help="Use only bert_* text embeddings and ignore all num__ / raw numeric text features.")
+    parser.add_argument("--allowed-text-cols", type=str, default=None, help="Comma-separated raw text columns allowed for text embedding construction.")
+    parser.add_argument("--allowed-numeric-cols", type=str, default=None, help="Comma-separated raw numeric text columns allowed for train-only preprocessing.")
+    parser.add_argument(
+        "--forbidden-feature-keywords",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated high-risk column-name keywords to block. Defaults include "
+            + ",".join(DEFAULT_FORBIDDEN_FEATURE_KEYWORDS)
+        ),
+    )
     parser.add_argument("--gene-id-col", type=str, default=None, help="Gene TSV ID column.")
     parser.add_argument("--gene-label-col", type=str, default=None, help="Gene TSV label column to drop from features.")
     parser.add_argument("--class-mode", type=str, choices=["multiclass", "binary"], default="binary")
@@ -2006,10 +2423,16 @@ def parse_train_args() -> MultiModalTrainConfig:
         text_cache_tsv=args.text_cache_tsv,
         label_col=args.label_col,
         metadata_sample_id_col=args.metadata_sample_id_col,
+        patient_id_col=args.patient_id_col,
         metadata_text_id_col=args.metadata_text_id_col,
         split_col=args.split_col,
         ct_path_col=args.ct_path_col,
         text_record_id_col=args.text_record_id_col,
+        strict_no_leakage=args.strict_no_leakage,
+        disable_text_numeric_features=args.disable_text_numeric_features,
+        allowed_text_cols=args.allowed_text_cols,
+        allowed_numeric_cols=args.allowed_numeric_cols,
+        forbidden_feature_keywords=args.forbidden_feature_keywords,
         gene_id_col=args.gene_id_col,
         gene_label_col=args.gene_label_col,
         class_mode=args.class_mode,
@@ -2072,10 +2495,16 @@ def parse_student_args() -> StudentKDConfig:
         text_cache_tsv=args.text_cache_tsv,
         label_col=args.label_col,
         metadata_sample_id_col=args.metadata_sample_id_col,
+        patient_id_col=args.patient_id_col,
         metadata_text_id_col=args.metadata_text_id_col,
         split_col=args.split_col,
         ct_path_col=args.ct_path_col,
         text_record_id_col=args.text_record_id_col,
+        strict_no_leakage=args.strict_no_leakage,
+        disable_text_numeric_features=args.disable_text_numeric_features,
+        allowed_text_cols=args.allowed_text_cols,
+        allowed_numeric_cols=args.allowed_numeric_cols,
+        forbidden_feature_keywords=args.forbidden_feature_keywords,
         gene_id_col=args.gene_id_col,
         gene_label_col=args.gene_label_col,
         class_mode=args.class_mode,

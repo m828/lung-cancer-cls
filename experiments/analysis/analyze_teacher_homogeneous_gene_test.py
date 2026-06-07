@@ -161,6 +161,7 @@ def _metrics_from_subset(labels: list[int], probs: list[float]) -> dict[str, flo
 def load_predictions(run_dir: Path) -> dict[str, Any] | None:
     tp = run_dir / "test_predictions.csv"
     if not tp.is_file():
+        print(f"[WARN] no test_predictions.csv for {run_dir.name}; paired bootstrap will skip it", file=sys.stderr)
         return None
     try:
         with tp.open("r", encoding="utf-8-sig", newline="") as f:
@@ -172,6 +173,7 @@ def load_predictions(run_dir: Path) -> dict[str, Any] | None:
                     id_col = c
                     break
             if not id_col:
+                print(f"[WARN] {tp} has neither sample_id nor record_id; paired bootstrap disabled for this run", file=sys.stderr)
                 return None
             for row in reader:
                 sid = row[id_col]
@@ -179,7 +181,8 @@ def load_predictions(run_dir: Path) -> dict[str, Any] | None:
                 prob = float(row["prob_malignant"])
                 rows[sid] = (label, prob)
         return {"rows": rows, "id_col": id_col}
-    except Exception:
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"[WARN] failed to load {tp}: {exc}; paired bootstrap will skip it", file=sys.stderr)
         return None
 
 
@@ -193,13 +196,24 @@ def analyse(run_dir: Path, group: str) -> dict[str, Any]:
         tm = m.get("test_metrics") or {}
         rec["seed"] = cfg.get("seed")
         rec["ct_model"] = cfg.get("ct_model")
-        rec["modalities"] = ",".join(cfg.get("modalities") or [])
+        modalities = cfg.get("modalities") or []
+        rec["modalities"] = modalities if isinstance(modalities, str) else ",".join(modalities)
         rec["batch_size"] = cfg.get("batch_size")
         rec["teacher_run_dir"] = cfg.get("teacher_run_dir", "none")
-        rec["distill_methods"] = ",".join(cfg.get("distill_methods") or [])
+        methods = cfg.get("distill_methods") or []
+        rec["distill_methods"] = methods if isinstance(methods, str) else ",".join(methods)
         rec["best_epoch"] = m.get("best_epoch")
         for k in METRICS:
             rec[k] = tm.get(k)
+    # Prefer stored metrics, but compute them from predictions if metrics.json lacks any target metric.
+    if any(rec.get(k) is None for k in METRICS):
+        pr = load_predictions(run_dir)
+        if pr:
+            labels = [v[0] for v in pr["rows"].values()]
+            probs = [v[1] for v in pr["rows"].values()]
+            computed = _metrics_from_subset(labels, probs)
+            for k in METRICS:
+                rec.setdefault(k, computed[k])
     return rec
 
 
@@ -246,6 +260,12 @@ def paired_bootstrap(
         return [{"metric": m, "n_samples": 0, "delta": "", "ci_lo": "", "ci_hi": "",
                  "p_value": "", "significant": "", "note": "insufficient common samples"} for m in metrics]
 
+    g1_available = [r for r in group1_runs if r["run_name"] in pred_index]
+    g2_available = [r for r in group2_runs if r["run_name"] in pred_index]
+    if not g1_available or not g2_available:
+        return [{"metric": m, "n_samples": 0, "delta": "", "ci_lo": "", "ci_hi": "",
+                 "p_value": "", "significant": "", "note": "missing paired predictions"} for m in metrics]
+
     common_ids = sorted(common_ids)
     n = len(common_ids)
 
@@ -256,14 +276,14 @@ def paired_bootstrap(
     for metric in metrics:
         observed_g1, observed_g2 = [], []
         for sid in common_ids:
-            g1_probs = [avg_prob(r["run_name"], sid) for r in group1_runs if r["run_name"] in pred_index]
-            g2_probs = [avg_prob(r["run_name"], sid) for r in group2_runs if r["run_name"] in pred_index]
+            g1_probs = [avg_prob(r["run_name"], sid) for r in g1_available]
+            g2_probs = [avg_prob(r["run_name"], sid) for r in g2_available]
             if g1_probs:
                 observed_g1.append(statistics.mean(g1_probs))
             if g2_probs:
                 observed_g2.append(statistics.mean(g2_probs))
 
-        labels = [pred_index[group1_runs[0]["run_name"]]["rows"][sid][0] for sid in common_ids]
+        labels = [pred_index[g1_available[0]["run_name"]]["rows"][sid][0] for sid in common_ids]
 
         if len(observed_g1) < 2 or len(observed_g2) < 2:
             results.append({"metric": metric, "n_samples": n, "delta": "", "ci_lo": "", "ci_hi": "",
@@ -310,6 +330,14 @@ def write_csv(records: list[dict[str, Any]], out: Path, fields: list[str]) -> No
         for r in records:
             w.writerow({k: r.get(k, "") for k in fields})
 
+
+
+
+def write_markdown_table(records: list[dict[str, Any]], out: Path, fields: list[str]) -> None:
+    lines = ["| " + " | ".join(fields) + " |", "|" + "|".join("---" for _ in fields) + "|"]
+    for r in records:
+        lines.append("| " + " | ".join(_fmt(r.get(k)) for k in fields) + " |")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 def write_teacher_summary(records: list[dict[str, Any]], bootstrap: list[dict[str, Any]], out: Path) -> None:
     L = []
@@ -486,6 +514,7 @@ def main() -> int:
     teacher_fields = ["group", "run_name", "seed", "ct_model", "modalities", "batch_size",
                       "teacher_run_dir", "best_epoch"] + METRICS
     write_csv(teacher_records, teacher_csv, teacher_fields)
+    write_markdown_table(teacher_records, teacher_md, teacher_fields)
 
     # Teacher bootstrap: T1 - T0
     t0_runs = by_group.get("T0_ct_text", [])
@@ -507,6 +536,7 @@ def main() -> int:
     student_fields = ["group", "run_name", "seed", "ct_model", "modalities", "batch_size",
                       "teacher_run_dir", "distill_methods", "best_epoch"] + METRICS
     write_csv(student_records, student_csv, student_fields)
+    write_markdown_table(student_records, student_md, student_fields)
 
     # Student bootstrap comparisons
     student_bootstrap = []
@@ -541,9 +571,11 @@ def main() -> int:
 
     # Print summary
     print(f"Wrote {teacher_csv}")
+    print(f"Wrote {teacher_md}")
     print(f"Wrote {teacher_summary}")
     print(f"Wrote {bootstrap_teacher_csv}")
     print(f"Wrote {student_csv}")
+    print(f"Wrote {student_md}")
     print(f"Wrote {student_summary}")
     print(f"Wrote {bootstrap_student_csv}")
     print(f"Runs analysed: {len(records)}")

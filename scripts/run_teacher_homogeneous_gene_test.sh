@@ -159,6 +159,7 @@ RUN_STAGE="${RUN_STAGE:-all}"         # all / teacher_only / student_only
 SKIP_TEACHER="${SKIP_TEACHER:-0}"     # 1 = 跳过 teacher 阶段 (兼容旧接口)
 SKIP_STUDENT="${SKIP_STUDENT:-0}"     # 1 = 跳过 student 阶段
 RUN_LIGHT_COMBO="${RUN_LIGHT_COMBO:-0}"  # 1 = 加跑 light-combo
+DRY_RUN="${DRY_RUN:-0}"              # 1 = 只打印命令，不启动训练/不改动结果
 
 # RUN_STAGE 映射
 if [[ "${RUN_STAGE}" == "student_only" ]]; then SKIP_TEACHER=1; fi
@@ -185,6 +186,7 @@ echo "RUN_STAGE    : ${RUN_STAGE}"
 echo "SKIP_TEACHER : ${SKIP_TEACHER}"
 echo "SKIP_STUDENT : ${SKIP_STUDENT}"
 echo "RUN_LIGHT_COMBO: ${RUN_LIGHT_COMBO}"
+echo "DRY_RUN     : ${DRY_RUN}"
 echo ""
 echo "Environment:"
 printf "  %-40s : %s\n" "outputs/ exists" "$(yesno "${RESULTS_ROOT}/outputs")"
@@ -204,6 +206,7 @@ missing=()
 [[ -z "${METADATA_CSV}" ]] && missing+=("METADATA_CSV")
 [[ -z "${CT_ROOT}" ]] && missing+=("CT_ROOT")
 [[ -z "${TEXT_FEATURE_TSV}" ]] && missing+=("TEXT_FEATURE_TSV")
+if [[ "${SKIP_TEACHER}" != "1" && -z "${GENE_TSV}" ]]; then missing+=("GENE_TSV"); fi
 if (( ${#missing[@]} > 0 )); then
     echo "[FATAL] Missing paths: ${missing[*]}"; exit 1
 fi
@@ -212,64 +215,108 @@ fi
 already_done() { [[ -f "$1/metrics.json" ]]; }
 
 validate_config() {
-    local outdir="$1" want_ct="$2" want_bs="$3" want_mods="$4"
+    local outdir="$1" want_ct="$2" want_bs="$3" want_mods="$4" want_teacher="${5:-}" want_methods="${6:-}"
     local mj="${outdir}/metrics.json"
-    python3 - "$mj" "$want_ct" "$want_bs" "$want_mods" <<'PY'
-import json, csv, sys
+    python3 - "$mj" "$want_ct" "$want_bs" "$want_mods" "$want_teacher" "$want_methods" <<'PY'
+import csv, json, sys
 from pathlib import Path
-mj, want_ct, want_bs, want_mods = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+mj, want_ct, want_bs, want_mods, want_teacher, want_methods = sys.argv[1:7]
+run_dir = Path(mj).parent
 m = json.loads(Path(mj).read_text(encoding="utf-8"))
 cfg = m.get("config") or {}
 mfd = m.get("modality_feature_dims") or {}
 issues = []
+
+def norm_csv(v):
+    if isinstance(v, str):
+        return ",".join(x.strip() for x in v.split(",") if x.strip())
+    return ",".join(v or [])
+
+def split_counts(path: Path):
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        col = next((c for c in ("assigned_split", "split", "Split") if reader.fieldnames and c in reader.fieldnames), None)
+        if not col:
+            return None
+        cnt = {"train": 0, "val": 0, "test": 0}; total = 0
+        for row in reader:
+            total += 1; v = (row.get(col) or "").strip().lower()
+            if v in cnt: cnt[v] += 1
+        return total, cnt["train"], cnt["val"], cnt["test"]
+
 if cfg.get("ct_model") != want_ct: issues.append(f"ct_model={cfg.get('ct_model')}!={want_ct}")
 if str(cfg.get("batch_size")) != want_bs: issues.append(f"bs={cfg.get('batch_size')}!={want_bs}")
-actual_mods = ",".join(cfg.get("modalities") or [])
+actual_mods = norm_csv(cfg.get("modalities"))
 if actual_mods != want_mods: issues.append(f"mods={actual_mods}!={want_mods}")
+if cfg.get("class_mode") != "binary": issues.append(f"class_mode={cfg.get('class_mode')}!=binary")
+if cfg.get("binary_task") != "malignant_vs_normal": issues.append(f"binary_task={cfg.get('binary_task')}!=malignant_vs_normal")
+if cfg.get("selection_metric") != "auroc": issues.append(f"selection_metric={cfg.get('selection_metric')}!=auroc")
 if not cfg.get("strict_no_leakage"): issues.append("STRICT_NOT_ENABLED")
 if not cfg.get("disable_text_numeric_features"): issues.append("NUM_NOT_DISABLED")
 if mfd.get("text_num") not in (0, None): issues.append(f"text_num={mfd.get('text_num')}")
-# split check
-sp = Path(mj).parent / "split_manifest.csv"
-if sp.is_file():
-    with sp.open("r", encoding="utf-8-sig", newline="") as f:
+if want_teacher:
+    actual_teacher = cfg.get("teacher_run_dir") or ""
+    try:
+        if Path(actual_teacher).resolve() != Path(want_teacher).resolve():
+            issues.append(f"teacher_run_dir={actual_teacher}!={want_teacher}")
+    except OSError:
+        issues.append(f"teacher_run_dir={actual_teacher}!={want_teacher}")
+actual_methods = norm_csv(cfg.get("distill_methods"))
+if want_methods and actual_methods != want_methods:
+    issues.append(f"distill_methods={actual_methods}!={want_methods}")
+if "hint" in actual_methods.split(","):
+    issues.append("FORBIDDEN_HINT_METHOD")
+split_path = run_dir / "split_manifest.csv"
+if not split_path.is_file() and cfg.get("reference_manifest"):
+    split_path = Path(str(cfg.get("reference_manifest")))
+counts = split_counts(split_path)
+if counts != (1019, 652, 163, 204):
+    issues.append(f"SPLIT_MISMATCH={counts}")
+tp = run_dir / "test_predictions.csv"
+if not tp.is_file():
+    issues.append("MISSING_TEST_PREDICTIONS")
+else:
+    with tp.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        col = None
-        for c in ("assigned_split", "split", "Split"):
-            if reader.fieldnames and c in reader.fieldnames: col = c; break
-        if col:
-            cnt = {"train":0,"val":0,"test":0}; total = 0
-            for row in reader:
-                total += 1; v = (row.get(col) or "").strip().lower()
-                if v in cnt: cnt[v] += 1
-            if (total, cnt["train"], cnt["val"], cnt["test"]) != (1019, 652, 163, 204):
-                issues.append(f"SPLIT_MISMATCH")
-if not (Path(mj).parent / "text_feature_audit.json").is_file():
+        id_col = next((c for c in ("sample_id", "record_id") if reader.fieldnames and c in reader.fieldnames), None)
+        n_rows = sum(1 for _ in reader)
+    if n_rows != 204:
+        issues.append(f"TEST_PRED_ROWS={n_rows}!=204")
+    if not id_col:
+        issues.append("MISSING_SAMPLE_OR_RECORD_ID")
+if not (run_dir / "text_feature_audit.json").is_file():
     issues.append("MISSING_AUDIT")
-if not (Path(mj).parent / "leakage_warnings.json").is_file():
+if not (run_dir / "leakage_warnings.json").is_file():
     issues.append("MISSING_WARNINGS")
 if issues:
     print("CONFIG_MISMATCH: " + "; ".join(issues))
     sys.exit(1)
-else:
-    print("OK")
-    sys.exit(0)
+print("OK")
+sys.exit(0)
 PY
 }
-
 run_cmd() {
     local name="$1"; shift; local outdir="$1"; shift
     local want_ct="$1"; shift; local want_bs="$1"; shift; local want_mods="$1"; shift
+    local want_teacher="$1"; shift; local want_methods="$1"; shift
     local logf="${OUT_ROOT}/logs/${name}.log"
     if already_done "${outdir}"; then
         local verdict
-        verdict="$(validate_config "${outdir}" "${want_ct}" "${want_bs}" "${want_mods}" 2>&1)" || true
+        verdict="$(validate_config "${outdir}" "${want_ct}" "${want_bs}" "${want_mods}" "${want_teacher}" "${want_methods}" 2>&1)" || true
         if [[ "${verdict}" == OK* ]]; then
             echo "[SKIP] ${name} — validated OK"; return 0
         else
             echo "[CONFIG_MISMATCH] ${name} — ${verdict}"
             echo "    -> Not overwriting. Fix manually or re-run."; return 1
         fi
+    fi
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        printf '[DRY-RUN] %s:' "${name}"
+        printf ' %q' "$@"
+        printf '\n'
+        return 0
     fi
     mkdir -p "${outdir}"
     echo ""
@@ -323,7 +370,7 @@ if [[ "${SKIP_TEACHER}" != "1" ]]; then
     for seed in "${SEEDS[@]}"; do
         tag="T0_densenet3d121_ct_text_teacher_seed${seed}"
         outdir="${OUT_ROOT}/densenet3d121_ct_text_teacher_strict_seed${seed}"
-        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" \
+        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" "" "" \
             python3 "${TRAIN_MM}" \
                 --output-dir "${outdir}" \
                 --modalities ct,text \
@@ -343,7 +390,7 @@ if [[ "${SKIP_TEACHER}" != "1" ]]; then
     for seed in "${SEEDS[@]}"; do
         tag="T1_densenet3d121_ct_cnv_text_teacher_seed${seed}"
         outdir="${OUT_ROOT}/densenet3d121_ct_cnv_text_teacher_strict_seed${seed}"
-        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,cnv,text" \
+        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,cnv,text" "" "" \
             python3 "${TRAIN_MM}" \
                 --output-dir "${outdir}" \
                 --modalities ct,cnv,text \
@@ -378,11 +425,23 @@ echo "--- S0: Reusing existing DenseNet3D121 CT+Text supervised (Group A) ---"
 for seed in "${SEEDS[@]}"; do
     src="${RESULTS_ROOT}/outputs0531_gene_privileged_ablation/ct_text_sc_densenet3d121_strict_bs4_seed${seed}"
     dst="${OUT_ROOT}/ct_text_sc_densenet3d121_strict_bs4_seed${seed}"
-    if [[ -f "${src}/metrics.json" ]] && [[ ! -e "${dst}" ]]; then
-        ln -s "${src}" "${dst}"
-        echo "[LINK] S0 seed${seed} -> ${src}"
-    elif [[ -e "${dst}" ]]; then
-        echo "[SKIP] S0 seed${seed} — exists"
+    if [[ -e "${dst}" ]]; then
+        verdict="$(validate_config "${dst}" "densenet3d_121" "4" "ct,text" "" "" 2>&1)" || true
+        if [[ "${verdict}" == OK* ]]; then
+            echo "[SKIP] S0 seed${seed} — validated OK"
+        else
+            echo "[CONFIG_MISMATCH] S0 seed${seed} — ${verdict}"
+        fi
+    elif [[ -f "${src}/metrics.json" ]]; then
+        verdict="$(validate_config "${src}" "densenet3d_121" "4" "ct,text" "" "" 2>&1)" || true
+        if [[ "${verdict}" != OK* ]]; then
+            echo "[CONFIG_MISMATCH] S0 seed${seed} source — ${verdict}"
+        elif [[ "${DRY_RUN}" == "1" ]]; then
+            echo "[DRY-RUN] ln -s ${src} ${dst}"
+        else
+            ln -s "${src}" "${dst}"
+            echo "[LINK] S0 seed${seed} -> ${src}"
+        fi
     else
         echo "[WARN] S0 seed${seed} — source not found at ${src}"
     fi
@@ -398,7 +457,7 @@ for seed in "${SEEDS[@]}"; do
     if [[ ! -f "${teacher_dir}/metrics.json" ]]; then
         echo "[SKIP] ${tag} — T0 teacher not ready"; continue
     fi
-    run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" \
+    run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" "${teacher_dir}" "${LOGITS_ONLY_METHODS}" \
         python3 "${TRAIN_KD}" \
             --output-dir "${outdir}" \
             --modalities ct,text \
@@ -428,7 +487,7 @@ for seed in "${SEEDS[@]}"; do
     if [[ ! -f "${teacher_dir}/metrics.json" ]]; then
         echo "[SKIP] ${tag} — T1 teacher not ready"; continue
     fi
-    run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" \
+    run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" "${teacher_dir}" "${LOGITS_ONLY_METHODS}" \
         python3 "${TRAIN_KD}" \
             --output-dir "${outdir}" \
             --modalities ct,text \
@@ -459,7 +518,7 @@ if [[ "${RUN_LIGHT_COMBO}" == "1" ]]; then
         if [[ ! -f "${teacher_dir}/metrics.json" ]]; then
             echo "[SKIP] ${tag} — T0 teacher not ready"; continue
         fi
-        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" \
+        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" "${teacher_dir}" "${LIGHT_COMBO_METHODS}" \
             python3 "${TRAIN_KD}" \
                 --output-dir "${outdir}" \
                 --modalities ct,text \
@@ -491,7 +550,7 @@ if [[ "${RUN_LIGHT_COMBO}" == "1" ]]; then
         if [[ ! -f "${teacher_dir}/metrics.json" ]]; then
             echo "[SKIP] ${tag} — T1 teacher not ready"; continue
         fi
-        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" \
+        run_cmd "${tag}" "${outdir}" "densenet3d_121" "4" "ct,text" "${teacher_dir}" "${LIGHT_COMBO_METHODS}" \
             python3 "${TRAIN_KD}" \
                 --output-dir "${outdir}" \
                 --modalities ct,text \
@@ -526,7 +585,9 @@ echo "All runs done. Running analysis..."
 echo "============================================================"
 
 ANALYSIS_PY="${PROJECT_ROOT}/experiments/analysis/analyze_teacher_homogeneous_gene_test.py"
-if [[ -f "${ANALYSIS_PY}" ]]; then
+if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "[DRY-RUN] python3 ${ANALYSIS_PY} --root ${OUT_ROOT} --results-root ${RESULTS_ROOT}"
+elif [[ -f "${ANALYSIS_PY}" ]]; then
     python3 "${ANALYSIS_PY}" --root "${OUT_ROOT}" --results-root "${RESULTS_ROOT}"
 else
     echo "[WARN] ${ANALYSIS_PY} not found — skip analysis"
@@ -535,8 +596,10 @@ fi
 echo ""
 echo "Outputs:"
 echo "  ${OUT_ROOT}/teacher_homogeneous_metrics.csv"
+echo "  ${OUT_ROOT}/teacher_homogeneous_metrics.md"
 echo "  ${OUT_ROOT}/teacher_homogeneous_summary.md"
 echo "  ${OUT_ROOT}/student_transfer_metrics.csv"
+echo "  ${OUT_ROOT}/student_transfer_metrics.md"
 echo "  ${OUT_ROOT}/student_transfer_summary.md"
 echo "  ${OUT_ROOT}/paired_bootstrap_teacher.csv"
 echo "  ${OUT_ROOT}/paired_bootstrap_student.csv"

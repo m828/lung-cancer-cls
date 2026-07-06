@@ -203,18 +203,32 @@ def load_targets(path: Path) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        logit_cols = sorted(
+            [c for c in fields if c.startswith("teacher_logit_") and c.rsplit("_", 1)[1].isdigit()],
+            key=lambda c: int(c.rsplit("_", 1)[1]),
+        )
+        prob_cols = sorted(
+            [c for c in fields if c.startswith("teacher_prob_") and c.rsplit("_", 1)[1].isdigit()],
+            key=lambda c: int(c.rsplit("_", 1)[1]),
+        )
         for row in reader:
             sid = str(row.get("sample_id", "")).strip()
             if not sid:
                 continue
-            out[sid] = {
-                "logit_0": float(row.get("teacher_logit_0", 0.0)),
-                "logit_1": float(row.get("teacher_logit_1", 0.0)),
-                "prob_0": float(row.get("teacher_prob_0", 0.0)),
-                "prob_1": float(row.get("teacher_prob_1", 0.0)),
+            values = {
                 "confidence": float(row.get("teacher_confidence", 0.0)),
                 "margin": float(row.get("teacher_margin", 0.0)),
             }
+            for col in logit_cols:
+                idx = int(col.rsplit("_", 1)[1])
+                values[f"logit_{idx}"] = float(row.get(col, 0.0))
+            for col in prob_cols:
+                idx = int(col.rsplit("_", 1)[1])
+                values[f"prob_{idx}"] = float(row.get(col, 0.0))
+            if values["confidence"] <= 0.0 and prob_cols:
+                values["confidence"] = max(values[f"prob_{int(col.rsplit('_', 1)[1])}"] for col in prob_cols)
+            out[sid] = values
     if not out:
         raise RuntimeError(f"No cached teacher targets loaded: {path}")
     return out
@@ -243,6 +257,22 @@ def load_prediction_probs(path: Path | None) -> dict[str, dict[str, float]]:
             sid = str(row.get(id_col, "")).strip()
             if not sid:
                 continue
+            probs: dict[int, float] = {}
+            for col in fields:
+                if col.startswith("prob_") and col[5:].isdigit():
+                    value = _float_or_none(row.get(col))
+                    if value is not None:
+                        probs[int(col[5:])] = value
+            malignant_idx = 2 if "prob_benign" in fields else 1
+            for name, idx in {"normal": 0, "benign": 1, "malignant": malignant_idx, "non_malignant": 0}.items():
+                col = f"prob_{name}"
+                if col in row:
+                    value = _float_or_none(row.get(col))
+                    if value is not None:
+                        probs[idx] = value
+            if probs:
+                out[sid] = {f"prob_{idx}": max(0.0, min(1.0, float(value))) for idx, value in probs.items()}
+                continue
             p1 = None
             for col in ("prob_1", "prob_malignant", "prob_pos", "y_prob", "score", "probability_malignant", "p"):
                 if col in row:
@@ -269,7 +299,17 @@ def load_prediction_probs(path: Path | None) -> dict[str, dict[str, float]]:
 
 
 def true_prob(values: dict[str, float], label: int) -> float:
-    return float(values["prob_1"] if int(label) == 1 else values["prob_0"])
+    return float(values.get(f"prob_{int(label)}", 0.0))
+
+
+def class_indices(values: dict[str, float], prefix: str = "logit_") -> list[int]:
+    indices: list[int] = []
+    for key in values:
+        if key.startswith(prefix):
+            suffix = key[len(prefix):]
+            if suffix.isdigit():
+                indices.append(int(suffix))
+    return sorted(indices)
 
 
 def raw_kd_weight(
@@ -393,14 +433,19 @@ def composite_score(metrics: dict[str, Any]) -> tuple[float, str]:
         "auroc": metrics.get("auroc"),
         "balanced_accuracy": metrics.get("balanced_accuracy"),
         "f1": metrics.get("f1"),
+        "recall": metrics.get("recall"),
         "ece": metrics.get("ece"),
     }
     if any(values[k] is None for k in values):
         score, used = resolve_selection_score(metrics, "auroc")
         return float(score), used
     return (
-        float(values["auroc"]) + 0.5 * float(values["balanced_accuracy"]) + 0.5 * float(values["f1"]) - 0.25 * float(values["ece"]),
-        "composite_auroc_bacc_f1_ece",
+        float(values["auroc"])
+        + 0.5 * float(values["balanced_accuracy"])
+        + 0.5 * float(values["f1"])
+        + 0.25 * float(values["recall"])
+        - 0.25 * float(values["ece"]),
+        "composite_auroc_bacc_f1_recall_ece",
     )
 
 
@@ -423,7 +468,10 @@ def batch_teacher_tensors(
         if sid not in targets:
             raise KeyError(f"sample_id missing in cached teacher targets: {sid}")
         t = targets[sid]
-        logits.append([t["logit_0"], t["logit_1"]])
+        indices = class_indices(t, "logit_")
+        if not indices:
+            raise KeyError(f"No teacher logits found for sample_id={sid}")
+        logits.append([t[f"logit_{idx}"] for idx in indices])
         if kd_weight_lookup is not None:
             w = kd_weight_lookup.get(sid, 0.0)
         elif weighting == "confidence":
@@ -434,8 +482,7 @@ def batch_teacher_tensors(
             if ref_targets is None or sid not in ref_targets:
                 w = 0.0
             else:
-                key = "prob_1" if int(label) == 1 else "prob_0"
-                w = max(0.0, t[key] - ref_targets[sid][key])
+                w = max(0.0, true_prob(t, int(label)) - true_prob(ref_targets[sid], int(label)))
         else:
             w = 1.0
         weights.append(max(float(floor), min(float(max_weight), float(w))))

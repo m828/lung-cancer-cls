@@ -145,7 +145,11 @@ def forward_split(model, loader, dataset, split_name: str, device: torch.device)
             logits = outputs["logits"].detach().cpu()
             probs = F.softmax(logits, dim=1)
             conf, pred = probs.max(dim=1)
-            margin = (probs[:, 1] - probs[:, 0]).abs() if probs.shape[1] == 2 else conf
+            if probs.shape[1] >= 2:
+                top2 = torch.topk(probs, k=2, dim=1).values
+                margin = top2[:, 0] - top2[:, 1]
+            else:
+                margin = conf
             for i in range(bs):
                 ds_i = offset + i
                 y = int(labels[i].item())
@@ -154,15 +158,13 @@ def forward_split(model, loader, dataset, split_name: str, device: torch.device)
                     "record_id": dataset.record_ids[ds_i],
                     "split": split_name,
                     "y_true": y,
-                    "teacher_logit_0": float(logits[i, 0].item()),
-                    "teacher_prob_0": float(probs[i, 0].item()),
                     "teacher_confidence": float(conf[i].item()),
                     "teacher_margin": float(margin[i].item()),
                     "teacher_correct": int(int(pred[i].item()) == y),
                 }
-                if logits.shape[1] > 1:
-                    row["teacher_logit_1"] = float(logits[i, 1].item())
-                    row["teacher_prob_1"] = float(probs[i, 1].item())
+                for class_idx in range(logits.shape[1]):
+                    row[f"teacher_logit_{class_idx}"] = float(logits[i, class_idx].item())
+                    row[f"teacher_prob_{class_idx}"] = float(probs[i, class_idx].item())
                 rows.append(row)
             offset += bs
     return rows
@@ -228,15 +230,14 @@ def main() -> int:
     if test_loader is not None and test_ds is not None:
         rows.extend(forward_split(model, test_loader, test_ds, "test", device))
 
+    class_count = len(class_names)
     fieldnames = [
         "sample_id",
         "record_id",
         "split",
         "y_true",
-        "teacher_logit_0",
-        "teacher_logit_1",
-        "teacher_prob_0",
-        "teacher_prob_1",
+        *[f"teacher_logit_{idx}" for idx in range(class_count)],
+        *[f"teacher_prob_{idx}" for idx in range(class_count)],
         "teacher_confidence",
         "teacher_margin",
         "teacher_correct",

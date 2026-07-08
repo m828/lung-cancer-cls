@@ -28,6 +28,8 @@ LR="${LR:-1e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 KD_ALPHA="${KD_ALPHA:-0.1}"
 KD_TEMPERATURE="${KD_TEMPERATURE:-8}"
+TRI_KD_SELECTION_METRIC="${TRI_KD_SELECTION_METRIC:-balanced_accuracy}"
+TRI_KD_OUTPUT_SUBDIR="${TRI_KD_OUTPUT_SUBDIR:-student_kd_ct_text_from_gene_teacher_bacc_select}"
 RESULTS_ROOT_HINT="${RESULTS_ROOT:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +70,7 @@ mkdir -p \
   "${OUT_ROOT}/teacher_ct_cnv_text" \
   "${OUT_ROOT}/supervised_ct_text" \
   "${OUT_ROOT}/student_kd_ct_text_from_gene_teacher" \
+  "${OUT_ROOT}/${TRI_KD_OUTPUT_SUBDIR}" \
   "${OUT_ROOT}/cached_teacher_targets" \
   "${OUT_ROOT}/logs" \
   "${OUT_ROOT}/scripts_used"
@@ -228,7 +231,7 @@ STUDENT_TRAIN_ARGS=(
     --ct-feature-dim 128 --text-feature-dim 256 --fusion-hidden-dim 256
     --dropout 0.3 --loss ce --label-smoothing 0.05
     --sampling-strategy weighted --class-weight-strategy effective_num --effective-num-beta 0.999
-    --selection-metric balanced_accuracy
+    --selection-metric "${TRI_KD_SELECTION_METRIC}"
     --split-mode train_val_test
 )
 
@@ -373,7 +376,7 @@ cache_csv() {
 }
 
 student_dir() {
-    echo "${OUT_ROOT}/student_kd_ct_text_from_gene_teacher/TRI-SKD_confidence_a0.1_T8_seed${1}"
+    echo "${OUT_ROOT}/${TRI_KD_OUTPUT_SUBDIR}/TRI-SKD_confidence_a0.1_T8_${TRI_KD_SELECTION_METRIC}_seed${1}"
 }
 
 stage_teacher() {
@@ -453,7 +456,6 @@ stage_student() {
             --lr "${LR}" --weight-decay "${WEIGHT_DECAY}" \
             --optimizer adamw --scheduler cosine --epochs "${EPOCHS}" --amp \
             --early-stopping-patience 10 --num-workers "${NUM_WORKERS}" \
-            --composite-selection-metric \
             "${STUDENT_TRAIN_ARGS[@]}"
     done
 }
@@ -483,6 +485,8 @@ text source type   : ${TEXT_SOURCE_TYPE}
 text source        : ${TEXT_SOURCE:-<missing>}
 class_mode / label_mode: multiclass / triclass
 num_classes        : ${NUM_CLASSES}
+TRI_KD_SELECTION_METRIC: ${TRI_KD_SELECTION_METRIC}
+TRI_KD_OUTPUT_SUBDIR: ${TRI_KD_OUTPUT_SUBDIR}
 label_col          : ${LABEL_COL}
 record_id_col      : ${TEXT_RECORD_ID_COL}
 groups             : TRI-T / TRI-S0 / TRI-SKD

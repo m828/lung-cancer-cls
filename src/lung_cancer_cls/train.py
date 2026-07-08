@@ -98,6 +98,10 @@ class TrainConfig:
     init_checkpoint: Path | None = None
     init_checkpoint_prefix: str | None = None
     group_split_mode: str = "auto"
+    transfer_mode: str = "full_finetune"
+    freeze_epochs: int = 0
+    encoder_lr_mult: float = 1.0
+    head_lr_mult: float = 1.0
 
 
 MULTICLASS_NAMES = {
@@ -111,8 +115,16 @@ SELECTION_METRICS = {
     "accuracy",
     "balanced_accuracy",
     "auroc",
+    "macro_auroc",
     "auprc",
     "f1",
+    "macro_f1",
+    "recall",
+    "specificity",
+    "malignant_recall",
+    "triclass_clinical_composite",
+    "triclass_calibrated_composite",
+    "transfer_composite",
     "loss",
 }
 
@@ -526,6 +538,57 @@ def resolve_selection_metric(selection_metric: str, num_classes: int) -> str:
 
 
 def get_selection_score(metrics: Dict[str, Any], metric_name: str) -> float | None:
+    if metric_name == "macro_auroc":
+        return _safe_float(metrics.get("macro_auroc", metrics.get("auroc")))
+    if metric_name == "macro_f1":
+        return _safe_float(metrics.get("macro_f1", metrics.get("f1")))
+    if metric_name == "malignant_recall":
+        return _safe_float(metrics.get("malignant_recall"))
+    if metric_name == "triclass_clinical_composite":
+        values = {
+            "balanced_accuracy": _safe_float(metrics.get("balanced_accuracy")),
+            "macro_f1": _safe_float(metrics.get("macro_f1", metrics.get("f1"))),
+            "malignant_recall": _safe_float(metrics.get("malignant_recall")),
+            "macro_auroc": _safe_float(metrics.get("macro_auroc", metrics.get("auroc"))),
+            "benign_recall": _safe_float(metrics.get("benign_recall")),
+        }
+        if any(value is None for value in values.values()):
+            return None
+        return (
+            0.25 * values["balanced_accuracy"]
+            + 0.25 * values["macro_f1"]
+            + 0.20 * values["malignant_recall"]
+            + 0.20 * values["macro_auroc"]
+            + 0.10 * values["benign_recall"]
+        )
+    if metric_name == "triclass_calibrated_composite":
+        values = {
+            "balanced_accuracy": _safe_float(metrics.get("balanced_accuracy")),
+            "macro_f1": _safe_float(metrics.get("macro_f1", metrics.get("f1"))),
+            "malignant_recall": _safe_float(metrics.get("malignant_recall")),
+            "macro_auroc": _safe_float(metrics.get("macro_auroc", metrics.get("auroc"))),
+            "ece": _safe_float(metrics.get("ece")),
+        }
+        if any(value is None for value in values.values()):
+            return None
+        return (
+            0.25 * values["balanced_accuracy"]
+            + 0.25 * values["macro_f1"]
+            + 0.20 * values["malignant_recall"]
+            + 0.20 * values["macro_auroc"]
+            + 0.10 * (1.0 - values["ece"])
+        )
+    if metric_name == "transfer_composite":
+        bacc = _safe_float(metrics.get("balanced_accuracy"))
+        f1 = _safe_float(metrics.get("f1"))
+        auroc = _safe_float(metrics.get("auroc"))
+        recall = _safe_float(metrics.get("recall"))
+        if any(value is None for value in (bacc, f1, auroc, recall)):
+            return None
+        ece = _safe_float(metrics.get("ece"))
+        if ece is None:
+            return 0.35 * bacc + 0.30 * f1 + 0.25 * auroc + 0.10 * recall
+        return 0.30 * bacc + 0.25 * f1 + 0.25 * auroc + 0.10 * recall + 0.10 * (1.0 - ece)
     value = _safe_float(metrics.get(metric_name))
     if value is None:
         return None
@@ -538,13 +601,18 @@ def resolve_selection_score(metrics: Dict[str, Any], metric_name: str) -> Tuple[
     score = get_selection_score(metrics, metric_name)
     if score is not None:
         return score, metric_name
-
-    fallback_metric = "accuracy"
-    fallback_score = get_selection_score(metrics, fallback_metric)
-    if fallback_score is not None:
-        return fallback_score, fallback_metric
-
-    return -float("inf"), metric_name
+    scalar_keys = []
+    for key, value in metrics.items():
+        try:
+            if _safe_float(value) is not None:
+                scalar_keys.append(str(key))
+        except (TypeError, ValueError):
+            continue
+    available = ", ".join(sorted(scalar_keys))
+    raise ValueError(
+        f"Selection metric '{metric_name}' is unavailable for this validation result. "
+        f"Available scalar metrics: {available}"
+    )
 
 
 def build_epoch_log(metrics: Dict[str, Any]) -> Dict[str, float | None]:
@@ -553,13 +621,19 @@ def build_epoch_log(metrics: Dict[str, Any]) -> Dict[str, float | None]:
         "accuracy",
         "balanced_accuracy",
         "auroc",
+        "macro_auroc",
         "auprc",
         "mcc",
         "f1",
+        "macro_f1",
         "precision",
         "recall",
+        "recall_macro",
         "sensitivity",
         "specificity",
+        "normal_recall",
+        "benign_recall",
+        "malignant_recall",
         "npv",
         "fpr",
         "fnr",
@@ -656,9 +730,31 @@ def compute_classification_metrics(
         )
     else:
         y_true_onehot = np.eye(num_classes, dtype=np.float32)[y_true]
+        confidences = probabilities.max(axis=1)
+        correctness = (predictions == y_true).astype(np.float32)
+        ece = 0.0
+        bin_edges = np.linspace(0.0, 1.0, 11)
+        for bin_idx in range(10):
+            lower = bin_edges[bin_idx]
+            upper = bin_edges[bin_idx + 1]
+            if bin_idx == 9:
+                mask = (confidences >= lower) & (confidences <= upper)
+            else:
+                mask = (confidences >= lower) & (confidences < upper)
+            if np.any(mask):
+                ece += abs(float(np.mean(correctness[mask])) - float(np.mean(confidences[mask]))) * (
+                    float(np.sum(mask)) / float(len(y_true))
+                )
         metrics.update(
             {
                 "auroc": _metric_with_fallback(
+                    roc_auc_score,
+                    y_true_onehot,
+                    probabilities,
+                    multi_class="ovr",
+                    average="macro",
+                ),
+                "macro_auroc": _metric_with_fallback(
                     roc_auc_score,
                     y_true_onehot,
                     probabilities,
@@ -684,9 +780,21 @@ def compute_classification_metrics(
                     recall_score(y_true, predictions, average="weighted", zero_division=0)
                 ),
                 "f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
+                "macro_f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
                 "f1_weighted": _safe_float(f1_score(y_true, predictions, average="weighted", zero_division=0)),
+                "brier_score": float(np.mean(np.sum((probabilities - y_true_onehot) ** 2, axis=1))),
+                "ece": float(ece),
             }
         )
+        cm = metrics["confusion_matrix"]
+        per_class_recall: Dict[str, float | None] = {}
+        for idx in labels:
+            denom = float(sum(cm[idx])) if idx < len(cm) else 0.0
+            value = None if denom <= 0 else float(cm[idx][idx] / denom)
+            name = class_names.get(idx, f"class_{idx}")
+            per_class_recall[f"{name}_recall"] = value
+            per_class_recall[f"recall_class_{idx}"] = value
+        metrics.update(per_class_recall)
 
     return metrics
 
@@ -796,6 +904,59 @@ def train_epoch(
         seen += y.size(0)
 
     return running_loss / max(seen, 1)
+
+
+HEAD_PARAM_KEYWORDS = ("classifier", "classification_head", "head", "fc", "logits")
+
+
+def _is_head_parameter(name: str) -> bool:
+    lowered = name.lower()
+    return any(key in lowered for key in HEAD_PARAM_KEYWORDS)
+
+
+def set_encoder_trainable(model: nn.Module, trainable: bool) -> Tuple[int, int]:
+    encoder_count = 0
+    head_count = 0
+    for name, param in model.named_parameters():
+        if _is_head_parameter(name):
+            param.requires_grad = True
+            head_count += param.numel()
+        else:
+            param.requires_grad = bool(trainable)
+            encoder_count += param.numel()
+    return encoder_count, head_count
+
+
+def optimizer_params_for_transfer(model: nn.Module, config: TrainConfig) -> list[Dict[str, Any]] | list[nn.Parameter]:
+    mode = config.transfer_mode.lower().strip()
+    if mode != "differential_lr":
+        return [param for param in model.parameters() if param.requires_grad]
+
+    encoder_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if _is_head_parameter(name):
+            head_params.append(param)
+        else:
+            encoder_params.append(param)
+
+    groups: list[Dict[str, Any]] = []
+    if encoder_params:
+        groups.append({"params": encoder_params, "lr": config.lr * float(config.encoder_lr_mult)})
+    if head_params:
+        groups.append({"params": head_params, "lr": config.lr * float(config.head_lr_mult)})
+    return groups if groups else [param for param in model.parameters() if param.requires_grad]
+
+
+def create_transfer_optimizer(config: TrainConfig, model: nn.Module) -> torch.optim.Optimizer:
+    return create_optimizer(
+        config.optimizer_name,
+        optimizer_params_for_transfer(model, config),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
 
 
 def train_model(config: TrainConfig) -> Dict[str, Any]:
@@ -1064,8 +1225,10 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     for i in train_idx:
         train_label_counts[samples[i].label] += 1
 
-    if config.sampling_strategy == "weighted":
+    if config.sampling_strategy in {"weighted", "class_balanced", "malignant_oversample"}:
         per_class_weights = [1.0 / max(1, c) for c in train_label_counts]
+        if config.sampling_strategy == "malignant_oversample" and len(per_class_weights) > 1:
+            per_class_weights[-1] *= 2.0
         sample_weights = [per_class_weights[samples[i].label] for i in train_idx]
         sampler = WeightedRandomSampler(
             weights=torch.tensor(sample_weights, dtype=torch.double),
@@ -1113,12 +1276,27 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             prefix=config.init_checkpoint_prefix,
         )
 
-    optimizer = create_optimizer(
-        config.optimizer_name,
-        model.parameters(),
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-    )
+    transfer_mode = config.transfer_mode.lower().strip()
+    freeze_modes = {"freeze_encoder", "freeze_then_finetune", "linear_probe_then_finetune"}
+    if transfer_mode in freeze_modes:
+        encoder_count, head_count = set_encoder_trainable(model, trainable=False)
+        print(
+            f"Transfer mode {transfer_mode}: encoder frozen, "
+            f"encoder_params={encoder_count}, head_params={head_count}"
+        )
+    elif transfer_mode == "differential_lr":
+        encoder_count, head_count = set_encoder_trainable(model, trainable=True)
+        print(
+            f"Transfer mode differential_lr: encoder_lr={config.lr * config.encoder_lr_mult:g}, "
+            f"head_lr={config.lr * config.head_lr_mult:g}, "
+            f"encoder_params={encoder_count}, head_params={head_count}"
+        )
+    elif transfer_mode == "full_finetune":
+        set_encoder_trainable(model, trainable=True)
+    else:
+        raise ValueError(f"Unknown transfer_mode: {config.transfer_mode}")
+
+    optimizer = create_transfer_optimizer(config, model)
     criterion = create_loss(
         config.loss_name,
         label_smoothing=config.label_smoothing,
@@ -1152,6 +1330,24 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
     print("-" * 60)
 
     for epoch in range(1, config.epochs + 1):
+        if (
+            transfer_mode in {"freeze_then_finetune", "linear_probe_then_finetune"}
+            and config.freeze_epochs > 0
+            and epoch == config.freeze_epochs + 1
+        ):
+            if transfer_mode == "linear_probe_then_finetune" and (out_dir / "best_model.pt").is_file():
+                model.load_state_dict(torch.load(out_dir / "best_model.pt", map_location=device))
+                print("[TRANSFER] restored best linear-probe head before full-model fine-tuning")
+            set_encoder_trainable(model, trainable=True)
+            optimizer = create_transfer_optimizer(config, model)
+            scheduler, scheduler_step_per_batch = create_scheduler(
+                config.scheduler_name,
+                optimizer,
+                epochs=max(1, config.epochs - config.freeze_epochs),
+                steps_per_epoch=len(train_loader),
+            )
+            print(f"[TRANSFER] unfroze encoder at epoch {epoch}; recreated optimizer/scheduler")
+
         train_loss = train_epoch(
             model,
             train_loader,
@@ -1195,7 +1391,7 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
               f"val_auc={_format_metric(_safe_float(val_metrics.get('auroc')))} "
               f"val_bacc={_format_metric(_safe_float(val_metrics.get('balanced_accuracy')))} "
               f"val_f1={_format_metric(_safe_float(val_metrics.get('f1')))} "
-              f"monitor({used_metric})={_format_metric(_safe_float(val_metrics.get(used_metric)))} "
+              f"monitor({used_metric})={_format_metric(_safe_float(selection_score))} "
               f"lr={optimizer.param_groups[0]['lr']:.6f}")
 
         if selection_score > best_val_score:
@@ -1274,6 +1470,10 @@ def train_model(config: TrainConfig) -> Dict[str, Any]:
             "finetune_lr": config.finetune_lr,
             "init_checkpoint": str(config.init_checkpoint) if config.init_checkpoint else None,
             "init_checkpoint_prefix": config.init_checkpoint_prefix,
+            "transfer_mode": config.transfer_mode,
+            "freeze_epochs": config.freeze_epochs,
+            "encoder_lr_mult": config.encoder_lr_mult,
+            "head_lr_mult": config.head_lr_mult,
         }
     }
     metrics["split_info"] = split_info
@@ -1437,8 +1637,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="使用预训练权重（2D 使用 ImageNet，3D 视频模型使用 Kinetics400）"
     )
     parser.add_argument(
-        "--aug-profile", type=str, choices=["basic", "strong"], default="basic",
-        help="数据增强配置：basic / strong"
+        "--aug-profile", type=str, choices=["basic", "mild", "strong"], default="basic",
+        help="数据增强配置：basic / mild / strong"
     )
     parser.add_argument(
         "--loss", type=str, choices=["ce", "focal", "mask_aware"], default="ce",
@@ -1464,7 +1664,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="学习率调度器"
     )
     parser.add_argument(
-        "--sampling-strategy", type=str, choices=["default", "weighted"], default="default",
+        "--sampling-strategy", type=str, choices=["default", "weighted", "class_balanced", "malignant_oversample"], default="default",
         help="训练采样策略：default / weighted（类别不平衡时推荐）"
     )
     parser.add_argument(
@@ -1496,6 +1696,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--init-checkpoint-prefix", type=str, default=None,
         help="Optional key prefix to strip when loading init weights, e.g. ct_encoder."
     )
+    parser.add_argument(
+        "--transfer-mode",
+        type=str,
+        choices=[
+            "full_finetune",
+            "freeze_encoder",
+            "freeze_then_finetune",
+            "differential_lr",
+            "linear_probe_then_finetune",
+        ],
+        default="full_finetune",
+        help="Transfer/fine-tuning mode for initialized LIDC experiments.",
+    )
+    parser.add_argument("--freeze-epochs", type=int, default=0, help="Epochs to keep encoder frozen before fine-tuning.")
+    parser.add_argument("--encoder-lr-mult", type=float, default=1.0, help="Encoder LR multiplier for differential_lr.")
+    parser.add_argument("--head-lr-mult", type=float, default=1.0, help="Head LR multiplier for differential_lr.")
     parser.add_argument(
         "--group-split-mode", type=str, choices=["none", "auto", "patient", "nodule"], default="auto",
         help="Split LIDC-IDRI by detected patient or nodule groups when possible."
@@ -1575,6 +1791,10 @@ def train_main(args: argparse.Namespace) -> Dict[str, Any]:
         init_checkpoint=Path(args.init_checkpoint) if args.init_checkpoint else None,
         init_checkpoint_prefix=args.init_checkpoint_prefix,
         group_split_mode=args.group_split_mode,
+        transfer_mode=args.transfer_mode,
+        freeze_epochs=args.freeze_epochs,
+        encoder_lr_mult=args.encoder_lr_mult,
+        head_lr_mult=args.head_lr_mult,
     )
     if config.two_stage_bundle_to_csv:
         return train_bundle_then_finetune_csv(config)

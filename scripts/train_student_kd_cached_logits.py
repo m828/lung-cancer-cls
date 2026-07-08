@@ -49,7 +49,7 @@ from lung_cancer_cls.multimodal_teacher_student import (  # noqa: E402
     split_cohort,
     validate_patient_split_integrity,
 )
-from lung_cancer_cls.train import resolve_selection_metric, resolve_selection_score  # noqa: E402
+from lung_cancer_cls.train import SELECTION_METRICS, resolve_selection_metric, resolve_selection_score  # noqa: E402
 from lung_cancer_cls.training_components import build_class_weights, create_loss, create_optimizer, create_scheduler  # noqa: E402
 
 
@@ -117,12 +117,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss", type=str, choices=["ce", "focal"], default="ce")
     p.add_argument("--label-smoothing", type=float, default=0.05)
     p.add_argument("--focal-gamma", type=float, default=2.0)
-    p.add_argument("--sampling-strategy", type=str, choices=["default", "weighted"], default="weighted")
+    p.add_argument("--sampling-strategy", type=str, choices=["default", "weighted", "class_balanced", "malignant_oversample"], default="weighted")
     p.add_argument("--class-weight-strategy", type=str, choices=["none", "inverse", "sqrt_inverse", "effective_num"], default="effective_num")
     p.add_argument("--effective-num-beta", type=float, default=0.999)
     p.add_argument("--distillation-alpha", type=float, default=0.1)
     p.add_argument("--distillation-temperature", type=float, default=4.0)
-    p.add_argument("--selection-metric", type=str, choices=["auto", "accuracy", "balanced_accuracy", "auroc", "auprc", "f1", "loss"], default="auroc")
+    p.add_argument("--selection-metric", type=str, choices=sorted(SELECTION_METRICS), default="auroc")
     p.add_argument("--composite-selection-metric", action="store_true")
     p.add_argument("--strict-no-leakage", action="store_true")
     p.add_argument("--disable-text-numeric-features", action="store_true")
@@ -133,9 +133,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema", type=float, default=0.0, help="EMA decay; 0 disables EMA.")
     p.add_argument("--gradient-clip", type=float, default=0.0)
     p.add_argument("--early-stopping-patience", type=int, default=0)
-    p.add_argument("--kd-weighting", type=str, choices=["none", "confidence", "margin", "advantage", "advantage_learnable"], default="none")
+    p.add_argument("--kd-weighting", type=str, choices=["none", "confidence", "margin", "class_confidence", "advantage", "advantage_learnable"], default="none")
     p.add_argument("--kd-weight-floor", type=float, default=0.0)
     p.add_argument("--kd-weight-max", type=float, default=1.0)
+    p.add_argument("--malignant-kd-boost", type=float, default=1.0, help="Boost KD weight when true label or teacher top1 is malignant.")
+    p.add_argument("--teacher-prob-smoothing", type=float, default=0.0, help="Uniform smoothing applied to teacher soft targets after temperature scaling.")
     p.add_argument("--no-save-predictions", action="store_true")
     return p.parse_args()
 
@@ -312,6 +314,16 @@ def class_indices(values: dict[str, float], prefix: str = "logit_") -> list[int]
     return sorted(indices)
 
 
+def teacher_top_class(values: dict[str, float]) -> int | None:
+    prob_indices = class_indices(values, "prob_")
+    if prob_indices:
+        return max(prob_indices, key=lambda idx: float(values.get(f"prob_{idx}", 0.0)))
+    logit_indices = class_indices(values, "logit_")
+    if logit_indices:
+        return max(logit_indices, key=lambda idx: float(values.get(f"logit_{idx}", 0.0)))
+    return None
+
+
 def raw_kd_weight(
     sid: str,
     label: int,
@@ -319,10 +331,15 @@ def raw_kd_weight(
     ref_targets: dict[str, dict[str, float]] | None,
     s0_predictions: dict[str, dict[str, float]],
     weighting: str,
+    malignant_kd_boost: float = 1.0,
 ) -> tuple[float, dict[str, float]]:
     t1 = targets[sid]
     if weighting == "confidence":
         return float(t1["confidence"]), {}
+    if weighting == "class_confidence":
+        teacher_top = teacher_top_class(t1)
+        boost = float(malignant_kd_boost) if int(label) == 2 or teacher_top == 2 else 1.0
+        return float(t1["confidence"]) * boost, {"teacher_top_class": float(teacher_top if teacher_top is not None else -1), "malignant_kd_boost": boost}
     if weighting == "margin":
         return float(t1["margin"]), {}
     if weighting == "advantage":
@@ -373,7 +390,15 @@ def prepare_kd_weight_lookup(
     for sid, label in zip(sample_ids, labels):
         if sid not in targets:
             raise KeyError(f"sample_id missing in cached teacher targets: {sid}")
-        raw, parts = raw_kd_weight(sid, int(label), targets, ref_targets, s0_predictions, args.kd_weighting)
+        raw, parts = raw_kd_weight(
+            sid,
+            int(label),
+            targets,
+            ref_targets,
+            s0_predictions,
+            args.kd_weighting,
+            args.malignant_kd_boost,
+        )
         raw_rows.append({"sample_id": sid, "label": int(label), "raw_weight": float(raw), **parts})
 
     max_raw = max((r["raw_weight"] for r in raw_rows), default=0.0)
@@ -392,6 +417,7 @@ def prepare_kd_weight_lookup(
     zero_rows = [r for r in raw_rows if weights.get(r["sample_id"], 0.0) <= 0.0]
     summary = {
         "kd_weighting": args.kd_weighting,
+        "malignant_kd_boost": float(args.malignant_kd_boost),
         "num_samples": len(values),
         "mean": mean,
         "std": std,
@@ -459,6 +485,8 @@ def batch_teacher_tensors(
     weighting: str,
     floor: float,
     max_weight: float,
+    malignant_kd_boost: float,
+    teacher_prob_smoothing: float,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = []
@@ -476,6 +504,10 @@ def batch_teacher_tensors(
             w = kd_weight_lookup.get(sid, 0.0)
         elif weighting == "confidence":
             w = t["confidence"]
+        elif weighting == "class_confidence":
+            teacher_top = teacher_top_class(t)
+            boost = float(malignant_kd_boost) if int(label) == 2 or teacher_top == 2 else 1.0
+            w = float(t["confidence"]) * boost
         elif weighting == "margin":
             w = t["margin"]
         elif weighting == "advantage":
@@ -488,6 +520,9 @@ def batch_teacher_tensors(
         weights.append(max(float(floor), min(float(max_weight), float(w))))
     teacher_logits = torch.tensor(logits, dtype=torch.float32, device=device)
     teacher_probs = F.softmax(teacher_logits / temp, dim=1)
+    smoothing = max(0.0, min(1.0, float(teacher_prob_smoothing)))
+    if smoothing > 0.0:
+        teacher_probs = teacher_probs * (1.0 - smoothing) + smoothing / teacher_probs.size(1)
     return teacher_probs, torch.tensor(weights, dtype=torch.float32, device=device)
 
 
@@ -525,6 +560,8 @@ def train_one_epoch(
             args.kd_weighting,
             args.kd_weight_floor,
             args.kd_weight_max,
+            args.malignant_kd_boost,
+            args.teacher_prob_smoothing,
             device,
         )
         use_amp = bool(args.amp and device.type == "cuda")

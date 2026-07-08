@@ -22,6 +22,7 @@ GROUPS = {
     "TRI-T": "teacher_ct_cnv_text",
     "TRI-S0": "supervised_ct_text",
     "TRI-SKD": "student_kd_ct_text_from_gene_teacher",
+    "TRI-SKD-BAcc": "student_kd_ct_text_from_gene_teacher_bacc_select",
 }
 METRICS = [
     "accuracy",
@@ -236,7 +237,12 @@ def md_table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def bootstrap_rows(root: Path, n_boot: int) -> list[dict[str, Any]]:
-    comparisons = [("TRI-SKD", "TRI-S0"), ("TRI-T", "TRI-S0")]
+    comparisons = [
+        ("TRI-SKD", "TRI-S0"),
+        ("TRI-SKD-BAcc", "TRI-S0"),
+        ("TRI-SKD-BAcc", "TRI-SKD"),
+        ("TRI-T", "TRI-S0"),
+    ]
     out = []
     pred_by_group_seed: dict[tuple[str, str], dict[str, tuple[int, list[float]]]] = {}
     for group, subdir in GROUPS.items():

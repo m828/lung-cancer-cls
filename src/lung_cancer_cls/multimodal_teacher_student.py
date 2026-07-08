@@ -1713,8 +1713,10 @@ def prepare_dataloaders(
 
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
     train_eval_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
-    if config.sampling_strategy == "weighted" and train_ds.labels:
+    if config.sampling_strategy in {"weighted", "class_balanced", "malignant_oversample"} and train_ds.labels:
         per_class_weights = [1.0 / max(1, count) for count in train_label_counts]
+        if config.sampling_strategy == "malignant_oversample" and len(per_class_weights) > 2:
+            per_class_weights[2] *= 2.0
         sample_weights = [per_class_weights[label] for label in train_ds.labels]
         sampler = WeightedRandomSampler(
             weights=torch.tensor(sample_weights, dtype=torch.double),
@@ -2353,7 +2355,7 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--loss", type=str, choices=["ce", "focal"], default="ce")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
-    parser.add_argument("--sampling-strategy", type=str, choices=["default", "weighted"], default="weighted")
+    parser.add_argument("--sampling-strategy", type=str, choices=["default", "weighted", "class_balanced", "malignant_oversample"], default="weighted")
     parser.add_argument("--class-weight-strategy", type=str, choices=["none", "inverse", "sqrt_inverse", "effective_num"], default="effective_num")
     parser.add_argument("--effective-num-beta", type=float, default=0.999)
     parser.add_argument("--no-save-predictions", action="store_true", help="Disable prediction CSV export.")

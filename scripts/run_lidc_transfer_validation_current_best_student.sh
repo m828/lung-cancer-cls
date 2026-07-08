@@ -32,7 +32,7 @@ LIDC_DATA_BASE="${LIDC_DATA_BASE:-${LIDC_DATA_ROOT_BASE:-/home/apulis-dev/userda
 LIDC_DATA_BASE_INPUT="${LIDC_DATA_BASE}"
 R3_ROOT="${R3_ROOT:-${PARENT_ROOT}/outputs0535_student_kd_refinement/refined_candidates}"
 R3_CHECKPOINT="${R3_CHECKPOINT:-}"
-INIT_PREFIX="${INIT_PREFIX:-ct_encoder.}"
+INIT_PREFIX="${INIT_PREFIX-__AUTO__}"
 R3_EXPORT_ROOT="${PARENT_ROOT}/outputs0535_student_kd_refinement/R3_checkpoint_export"
 
 while [[ $# -gt 0 ]]; do
@@ -111,6 +111,17 @@ find_r3_checkpoint() {
 
 R3_CKPT_RESOLVED="$(find_r3_checkpoint || true)"
 
+resolve_init_prefix() {
+    if [[ "${INIT_PREFIX}" != "__AUTO__" ]]; then
+        echo "${INIT_PREFIX}"
+    elif [[ -n "${R3_CKPT_RESOLVED}" && "$(basename "${R3_CKPT_RESOLVED}")" == "best_ct_encoder.pt" ]]; then
+        echo ""
+    else
+        echo "ct_encoder."
+    fi
+}
+INIT_PREFIX_RESOLVED="$(resolve_init_prefix)"
+
 run_cmd() {
     local name="$1"
     local out_path="$2"
@@ -162,6 +173,66 @@ baseline_out() {
 kdinit_out() {
     local fold="$1"
     echo "${OUT_ROOT}/kd_init/LIDC-KDInit_R3ct_${MODEL}_fold${fold}"
+}
+
+kdinit_audit_json() {
+    echo "${OUT_ROOT}/lidc_kdinit_loading_audit.json"
+}
+
+kdinit_audit_md() {
+    echo "${OUT_ROOT}/lidc_kdinit_loading_audit.md"
+}
+
+r3_source_run_dir() {
+    if [[ -n "${R3_CKPT_RESOLVED}" && -f "$(dirname "${R3_CKPT_RESOLVED}")/metrics.json" ]]; then
+        echo "$(dirname "${R3_CKPT_RESOLVED}")"
+    else
+        echo ""
+    fi
+}
+
+audit_kdinit_loading() {
+    if [[ -z "${R3_CKPT_RESOLVED}" ]]; then
+        echo "[MISSING] audit_lidc_kdinit_loading: R3 checkpoint not found under ${R3_ROOT} or ${R3_EXPORT_ROOT}; set R3_CHECKPOINT=/path/to/best_model.pt"
+        return 0
+    fi
+    if [[ ! -f "${R3_CKPT_RESOLVED}" && "${DRY_RUN}" != "1" ]]; then
+        echo "[MISSING] audit_lidc_kdinit_loading: ${R3_CKPT_RESOLVED}"
+        return 0
+    fi
+    local source_run_dir
+    source_run_dir="$(r3_source_run_dir)"
+    local -a source_args=()
+    if [[ -n "${source_run_dir}" ]]; then
+        source_args=(--source-run-dir "${source_run_dir}")
+    fi
+    local logfile="${OUT_ROOT}/logs/audit_lidc_kdinit_loading.log"
+    if [[ "${DRY_RUN}" == "1" ]]; then
+        echo "[DRY_RUN] audit_lidc_kdinit_loading"
+        echo "          out: $(kdinit_audit_json)"
+        echo "          cmd: python3 experiments/analysis/audit_lidc_kdinit_loading.py --checkpoint ${R3_CKPT_RESOLVED} --lidc-model ${MODEL} --lidc-num-classes 2 --init-prefix ${INIT_PREFIX_RESOLVED} --source-backbone densenet3d_121 --output-json $(kdinit_audit_json) --output-md $(kdinit_audit_md) ${source_args[*]}"
+        return 0
+    fi
+    mkdir -p "$(dirname "${logfile}")" "$(dirname "$(kdinit_audit_json)")"
+    echo "[RUN ] audit_lidc_kdinit_loading"
+    echo "       out: $(kdinit_audit_json)"
+    echo "       log: ${logfile}"
+    set +e
+    python3 experiments/analysis/audit_lidc_kdinit_loading.py \
+        --checkpoint "${R3_CKPT_RESOLVED}" \
+        --lidc-model "${MODEL}" \
+        --lidc-num-classes 2 \
+        --init-prefix "${INIT_PREFIX_RESOLVED}" \
+        --source-backbone densenet3d_121 \
+        --output-json "$(kdinit_audit_json)" \
+        --output-md "$(kdinit_audit_md)" \
+        "${source_args[@]}" 2>&1 | tee "${logfile}"
+    local rc=${PIPESTATUS[0]}
+    set -e
+    if (( rc != 0 )); then
+        echo "[FAIL] audit_lidc_kdinit_loading: exit ${rc}; continuing"
+    fi
+    return 0
 }
 
 stage_manifest() {
@@ -275,6 +346,7 @@ stage_train() {
     if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
         check_existing_lidc || return 0
     fi
+    audit_kdinit_loading
     local fold
     for fold in "${FOLDS[@]}"; do
         if [[ ! -d "$(fold_data_root "${fold}")" && "${DRY_RUN}" != "1" ]]; then
@@ -300,7 +372,7 @@ stage_train() {
                 --output-dir "$(kdinit_out "${fold}")" \
                 $(train_args_for_fold "${fold}") \
                 --init-checkpoint "${R3_CKPT_RESOLVED}" \
-                --init-checkpoint-prefix "${INIT_PREFIX}"
+                --init-checkpoint-prefix "${INIT_PREFIX_RESOLVED}"
         fi
     done
 }
@@ -333,12 +405,14 @@ LIDC_DATA_BASE   : ${LIDC_DATA_BASE}
 LIDC_DATA_NOTE   : ${LIDC_DATA_BASE_NOTE}
 R3_ROOT          : ${R3_ROOT}
 R3_CHECKPOINT    : ${R3_CKPT_RESOLVED:-<missing>}
+INIT_PREFIX      : ${INIT_PREFIX_RESOLVED}
 GROUPS           : LIDC-B CT baseline; LIDC-KDInit CT encoder initialized from R3
 ============================================================
 EOF
 
 if [[ "${STAGE}" == "manifest" || "${STAGE}" == "all" ]]; then stage_manifest; fi
 if [[ "${STAGE}" == "prepare" || "${STAGE}" == "all" ]]; then stage_prepare; fi
+if [[ "${STAGE}" == "audit" ]]; then audit_kdinit_loading; fi
 if [[ "${STAGE}" == "train" || "${STAGE}" == "all" ]]; then stage_train; fi
 if [[ "${STAGE}" == "analyze" || "${STAGE}" == "all" ]]; then stage_analyze; fi
 

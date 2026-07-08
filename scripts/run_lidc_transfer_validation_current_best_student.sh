@@ -10,11 +10,13 @@ cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 PARENT_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
-OUT_ROOT="${OUT_ROOT:-${PARENT_ROOT}/outputs0537_lidc_transfer_validation}"
+DEFAULT_OUT_ROOT="/home/apulis-dev/userdata/mmy/lung-cancer-cls-main0518/outputs0537_lidc_transfer_validation"
+OUT_ROOT="${OUT_ROOT:-${DEFAULT_OUT_ROOT}}"
 STAGE="${STAGE:-all}"
 RUN_MODE="${RUN_MODE:-mini}"
 SMOKE="${SMOKE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+USE_EXISTING_LIDC="${USE_EXISTING_LIDC:-1}"
 EPOCHS="${EPOCHS:-40}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
@@ -25,19 +27,57 @@ VOLUME_HW="${VOLUME_HW:-64}"
 MODEL="${MODEL:-densenet3d_121}"
 
 LIDC_RAW_ROOT="${LIDC_RAW_ROOT:-/workspace/data-lung/LIDC-IDRI}"
-LIDC_MANIFEST_ROOT="${LIDC_MANIFEST_ROOT:-${OUT_ROOT}/lidc_bvm_manifest_consensus}"
-LIDC_DATA_ROOT_BASE="${LIDC_DATA_ROOT_BASE:-/workspace/data-lung/lidc_idri_consensus_3d_fold}"
+LIDC_MANIFEST_DIR="${LIDC_MANIFEST_DIR:-${LIDC_MANIFEST_ROOT:-/home/apulis-dev/userdata/mmy/Data/lidc_bvm_manifest_consensus}}"
+LIDC_DATA_BASE="${LIDC_DATA_BASE:-${LIDC_DATA_ROOT_BASE:-/home/apulis-dev/userdata/mmy/Data/lidc_idri_consensus_3d_fold}}"
+LIDC_DATA_BASE_INPUT="${LIDC_DATA_BASE}"
 R3_ROOT="${R3_ROOT:-${PARENT_ROOT}/outputs0535_student_kd_refinement/refined_candidates}"
 R3_CHECKPOINT="${R3_CHECKPOINT:-}"
 INIT_PREFIX="${INIT_PREFIX:-ct_encoder.}"
+R3_EXPORT_ROOT="${PARENT_ROOT}/outputs0535_student_kd_refinement/R3_checkpoint_export"
 
-mkdir -p \
-  "${OUT_ROOT}/baseline" \
-  "${OUT_ROOT}/kd_init" \
-  "${OUT_ROOT}/folds" \
-  "${OUT_ROOT}/logs" \
-  "${OUT_ROOT}/scripts_used"
-cp -f "${BASH_SOURCE[0]}" "${OUT_ROOT}/scripts_used/run_lidc_transfer_validation_current_best_student.sh.snapshot"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --root)
+            # Accepted for compatibility with other wrappers; data paths come
+            # from LIDC_MANIFEST_DIR / LIDC_DATA_BASE in existing-data mode.
+            shift 2
+            ;;
+        --out-root)
+            OUT_ROOT="$2"
+            shift 2
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+normalize_lidc_data_base() {
+    local base="${1%/}"
+    if [[ "${base}" =~ ^(.+_fold)[0-9]+$ ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "${base}"
+    fi
+}
+
+LIDC_DATA_BASE="$(normalize_lidc_data_base "${LIDC_DATA_BASE}")"
+if [[ "${LIDC_DATA_BASE}" != "${LIDC_DATA_BASE_INPUT%/}" ]]; then
+    LIDC_DATA_BASE_NOTE="normalized from ${LIDC_DATA_BASE_INPUT}"
+else
+    LIDC_DATA_BASE_NOTE="prefix for fold ids"
+fi
+
+if [[ "${DRY_RUN}" != "1" ]]; then
+    mkdir -p \
+      "${OUT_ROOT}/baseline" \
+      "${OUT_ROOT}/kd_init" \
+      "${OUT_ROOT}/folds" \
+      "${OUT_ROOT}/logs" \
+      "${OUT_ROOT}/scripts_used"
+    cp -f "${BASH_SOURCE[0]}" "${OUT_ROOT}/scripts_used/run_lidc_transfer_validation_current_best_student.sh.snapshot"
+fi
 
 if [[ "${SMOKE}" == "1" ]]; then
     FOLDS=(0)
@@ -55,6 +95,8 @@ find_r3_checkpoint() {
     local cand
     for cand in \
         "${R3_ROOT}/R3_confidence_a0.1_T8_bs12_lr1e-4_composite_seed42/best_model.pt" \
+        "${R3_EXPORT_ROOT}/best_ct_encoder.pt" \
+        "${R3_EXPORT_ROOT}/best_model.pt" \
         "${R3_ROOT}/R3_confidence_a0.1_T8_bs12_lr1e-4_composite_seed45/best_model.pt" \
         "${R3_ROOT}/R3_confidence_a0.1_T8_bs12_lr1e-4_composite_seed44/best_model.pt" \
         "${R3_ROOT}/R3_confidence_a0.1_T8_bs12_lr1e-4_composite_seed43/best_model.pt"; do
@@ -100,12 +142,16 @@ run_cmd() {
 
 fold_data_root() {
     local fold="$1"
-    echo "${LIDC_DATA_ROOT_BASE}${fold}"
+    echo "${LIDC_DATA_BASE}${fold}"
 }
 
 fold_manifest() {
     local fold="$1"
-    echo "$(fold_data_root "${fold}")/processed_split_manifest.csv"
+    if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
+        echo "${LIDC_MANIFEST_DIR}/split_manifest.csv"
+    else
+        echo "$(fold_data_root "${fold}")/processed_split_manifest.csv"
+    fi
 }
 
 baseline_out() {
@@ -119,18 +165,22 @@ kdinit_out() {
 }
 
 stage_manifest() {
-    if [[ -f "${LIDC_MANIFEST_ROOT}/split_manifest.csv" && "${DRY_RUN}" != "1" ]]; then
-        echo "[SKIP] lidc_manifest: exists ${LIDC_MANIFEST_ROOT}/split_manifest.csv"
+    if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
+        echo "[SKIP] lidc_manifest: USE_EXISTING_LIDC=1; using ${LIDC_MANIFEST_DIR}/split_manifest.csv"
+        return 0
+    fi
+    if [[ -f "${LIDC_MANIFEST_DIR}/split_manifest.csv" && "${DRY_RUN}" != "1" ]]; then
+        echo "[SKIP] lidc_manifest: exists ${LIDC_MANIFEST_DIR}/split_manifest.csv"
         return 0
     fi
     if [[ ! -d "${LIDC_RAW_ROOT}" && "${DRY_RUN}" != "1" ]]; then
         echo "[MISSING] LIDC raw root: ${LIDC_RAW_ROOT}"
         return 0
     fi
-    run_cmd "build_lidc_manifest" "${LIDC_MANIFEST_ROOT}/split_manifest.csv" \
+    run_cmd "build_lidc_manifest" "${LIDC_MANIFEST_DIR}/split_manifest.csv" \
         python3 build_lidc_idri_split_manifest.py \
         --input-root "${LIDC_RAW_ROOT}" \
-        --output-dir "${LIDC_MANIFEST_ROOT}" \
+        --output-dir "${LIDC_MANIFEST_DIR}" \
         --metadata-source auto \
         --annotation-policy consensus \
         --consensus-min-readers 2 \
@@ -144,21 +194,25 @@ stage_manifest() {
 }
 
 stage_prepare() {
+    if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
+        echo "[SKIP] prepare_lidc: USE_EXISTING_LIDC=1; using existing fold directories ${LIDC_DATA_BASE}{0..4}"
+        return 0
+    fi
     local fold
     for fold in "${FOLDS[@]}"; do
         if [[ -f "$(fold_manifest "${fold}")" && "${DRY_RUN}" != "1" ]]; then
             echo "[SKIP] prepare_lidc_fold${fold}: exists $(fold_manifest "${fold}")"
             continue
         fi
-        if [[ ! -f "${LIDC_MANIFEST_ROOT}/nodule_manifest.csv" && "${DRY_RUN}" != "1" ]]; then
-            echo "[MISSING] nodule manifest for fold${fold}: ${LIDC_MANIFEST_ROOT}/nodule_manifest.csv"
+        if [[ ! -f "${LIDC_MANIFEST_DIR}/nodule_manifest.csv" && "${DRY_RUN}" != "1" ]]; then
+            echo "[MISSING] nodule manifest for fold${fold}: ${LIDC_MANIFEST_DIR}/nodule_manifest.csv"
             continue
         fi
         run_cmd "prepare_lidc_fold${fold}" "$(fold_manifest "${fold}")" \
             python3 prepare_lidc_idri_consensus_3d.py \
             --input-root "${LIDC_RAW_ROOT}" \
-            --manifest-csv "${LIDC_MANIFEST_ROOT}/nodule_manifest.csv" \
-            --split-manifest-csv "${LIDC_MANIFEST_ROOT}/split_manifest.csv" \
+            --manifest-csv "${LIDC_MANIFEST_DIR}/nodule_manifest.csv" \
+            --split-manifest-csv "${LIDC_MANIFEST_DIR}/split_manifest.csv" \
             --split-fold "${fold}" \
             --output-root "$(fold_data_root "${fold}")" \
             --depth-size "${DEPTH_SIZE}" \
@@ -167,6 +221,35 @@ stage_prepare() {
             --min-size-xy 32 \
             --min-size-z 8
     done
+}
+
+check_existing_lidc() {
+    local missing=0
+    local path
+    for path in \
+        "${LIDC_MANIFEST_DIR}/nodule_manifest.csv" \
+        "${LIDC_MANIFEST_DIR}/split_manifest.csv"; do
+        if [[ -f "${path}" ]]; then
+            echo "[OK] existing LIDC file: ${path}"
+        else
+            echo "[MISSING] existing LIDC file: ${path}"
+            missing=1
+        fi
+    done
+    local fold
+    for fold in 0 1 2 3 4; do
+        path="${LIDC_DATA_BASE}${fold}"
+        if [[ -d "${path}" ]]; then
+            echo "[OK] existing LIDC fold${fold}: ${path}"
+        else
+            echo "[MISSING] existing LIDC fold${fold}: ${path}"
+            missing=1
+        fi
+    done
+    if (( missing != 0 && DRY_RUN != 1 )); then
+        return 1
+    fi
+    return 0
 }
 
 train_args_for_fold() {
@@ -189,6 +272,9 @@ train_args_for_fold() {
 }
 
 stage_train() {
+    if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
+        check_existing_lidc || return 0
+    fi
     local fold
     for fold in "${FOLDS[@]}"; do
         if [[ ! -d "$(fold_data_root "${fold}")" && "${DRY_RUN}" != "1" ]]; then
@@ -205,7 +291,7 @@ stage_train() {
             $(train_args_for_fold "${fold}")
 
         if [[ -z "${R3_CKPT_RESOLVED}" ]]; then
-            echo "[MISSING] LIDC-KDInit_fold${fold}: R3 best_model.pt not found under ${R3_ROOT}; set R3_CHECKPOINT=/path/to/best_model.pt"
+            echo "[MISSING] LIDC-KDInit_fold${fold}: R3 checkpoint not found under ${R3_ROOT} or ${R3_EXPORT_ROOT}; set R3_CHECKPOINT=/path/to/best_model.pt"
         elif [[ ! -f "${R3_CKPT_RESOLVED}" && "${DRY_RUN}" != "1" ]]; then
             echo "[MISSING] LIDC-KDInit_fold${fold}: ${R3_CKPT_RESOLVED}"
         else
@@ -224,6 +310,12 @@ stage_analyze() {
         python3 experiments/analysis/analyze_lidc_transfer_validation.py --root "${OUT_ROOT}"
 }
 
+if [[ "${USE_EXISTING_LIDC}" == "1" ]]; then
+    LIDC_RAW_ROOT_DISPLAY="<unused: USE_EXISTING_LIDC=1>"
+else
+    LIDC_RAW_ROOT_DISPLAY="${LIDC_RAW_ROOT}"
+fi
+
 cat <<EOF
 ============================================================
 LIDC transfer validation: current best R3 CT encoder
@@ -233,10 +325,12 @@ STAGE            : ${STAGE}
 RUN_MODE         : ${RUN_MODE}
 SMOKE            : ${SMOKE}
 DRY_RUN          : ${DRY_RUN}
+USE_EXISTING_LIDC: ${USE_EXISTING_LIDC}
 FOLDS            : ${FOLDS[*]}
-LIDC_RAW_ROOT    : ${LIDC_RAW_ROOT}
-LIDC_MANIFEST    : ${LIDC_MANIFEST_ROOT}
-LIDC_DATA_BASE   : ${LIDC_DATA_ROOT_BASE}
+LIDC_RAW_ROOT    : ${LIDC_RAW_ROOT_DISPLAY}
+LIDC_MANIFEST_DIR: ${LIDC_MANIFEST_DIR}
+LIDC_DATA_BASE   : ${LIDC_DATA_BASE}
+LIDC_DATA_NOTE   : ${LIDC_DATA_BASE_NOTE}
 R3_ROOT          : ${R3_ROOT}
 R3_CHECKPOINT    : ${R3_CKPT_RESOLVED:-<missing>}
 GROUPS           : LIDC-B CT baseline; LIDC-KDInit CT encoder initialized from R3

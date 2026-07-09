@@ -782,7 +782,7 @@ def compute_classification_metrics(
                 "f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
                 "macro_f1": _safe_float(f1_score(y_true, predictions, average="macro", zero_division=0)),
                 "f1_weighted": _safe_float(f1_score(y_true, predictions, average="weighted", zero_division=0)),
-                "brier_score": float(np.mean(np.sum((probabilities - y_true_onehot) ** 2, axis=1))),
+                "brier_score": float(np.mean(np.sum((probabilities - y_true_onehot) ** 2, axis=1) / num_classes)),
                 "ece": float(ece),
             }
         )

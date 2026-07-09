@@ -34,6 +34,7 @@ from lung_cancer_cls.text_clinical import (
     write_text_feature_audit,
 )
 from lung_cancer_cls.train import (
+    SELECTION_METRICS,
     build_epoch_log,
     compute_classification_metrics,
     resolve_selection_metric,
@@ -96,6 +97,7 @@ class MultiModalTrainConfig:
     class_mode: str = "binary"
     binary_task: str = "malignant_vs_normal"
     selection_metric: str = "auto"
+    extra_checkpoint_metrics: Tuple[str, ...] = ()
     split_mode: str = "train_val_test"
     use_predefined_split: bool = False
     val_ratio: float = 0.2
@@ -156,6 +158,23 @@ def normalize_modalities(raw: str | Sequence[str]) -> Tuple[str, ...]:
     if not normalized:
         raise ValueError("At least one modality is required.")
     return tuple(normalized)
+
+
+def normalize_selection_metric_list(raw: str | Sequence[str] | None) -> Tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        values = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    else:
+        values = [str(item).strip().lower() for item in raw if str(item).strip()]
+    out: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return tuple(out)
 
 
 def _canonical_distill_method(value: str) -> str:
@@ -1807,13 +1826,28 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
         steps_per_epoch=len(train_loader),
     )
 
+    extra_checkpoint_metrics = tuple(
+        resolve_selection_metric(metric, len(class_names))
+        for metric in normalize_selection_metric_list(config.extra_checkpoint_metrics)
+    )
     best_val_score = -float("inf")
     best_epoch = 0
     best_val_metrics: Dict[str, Any] | None = None
+    extra_best: Dict[str, Dict[str, Any]] = {
+        metric: {
+            "score": -float("inf"),
+            "epoch": 0,
+            "val_metrics_at_selection": None,
+            "checkpoint_path": str(config.output_dir / f"best_{metric}.pt"),
+        }
+        for metric in extra_checkpoint_metrics
+    }
     history: List[Dict[str, Any]] = []
 
     print(f"Aligned samples: total={len(cohort)} train={len(train_idx)} val={len(val_idx)} test={len(test_idx)} split_source={split_source}")
     print(f"Selection metric: {selection_metric}")
+    if extra_checkpoint_metrics:
+        print(f"Extra checkpoint metrics: {', '.join(extra_checkpoint_metrics)}")
     print("-" * 60)
 
     for epoch in range(1, config.epochs + 1):
@@ -1853,7 +1887,7 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
             f"val_auc={_format_metric(_safe_float(val_metrics.get('auroc')))} "
             f"val_bacc={_format_metric(_safe_float(val_metrics.get('balanced_accuracy')))} "
             f"val_f1={_format_metric(_safe_float(val_metrics.get('f1')))} "
-            f"monitor({used_metric})={_format_metric(_safe_float(val_metrics.get(used_metric)))} "
+            f"monitor({used_metric})={_format_metric(_safe_float(selection_score))} "
             f"lr={optimizer.param_groups[0]['lr']:.6f}"
         )
 
@@ -1863,6 +1897,40 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
             best_val_metrics = val_metrics
             torch.save(model.state_dict(), config.output_dir / "best_model.pt")
             print(f"  保存最佳模型 (epoch {epoch})")
+
+        for metric in extra_checkpoint_metrics:
+            metric_score, metric_used = resolve_selection_score(val_metrics, metric)
+            record = extra_best[metric]
+            if record["val_metrics_at_selection"] is None or metric_score > float(record["score"]):
+                record["score"] = float(metric_score)
+                record["epoch"] = epoch
+                record["selection_metric_used"] = metric_used
+                record["val_metrics_at_selection"] = val_metrics
+                torch.save(model.state_dict(), config.output_dir / f"best_{metric}.pt")
+                print(f"  保存 {metric} 最佳模型 (epoch {epoch})")
+
+    multi_metric_checkpoints: List[Dict[str, Any]] = []
+    for metric in extra_checkpoint_metrics:
+        ckpt_path = config.output_dir / f"best_{metric}.pt"
+        record = extra_best[metric]
+        if not ckpt_path.is_file():
+            continue
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        selected_val_metrics = evaluate_model(model, val_loader, device, criterion, class_names)
+        selected_test_metrics = evaluate_model(model, test_loader, device, criterion, class_names) if test_loader is not None else None
+        multi_metric_checkpoints.append(
+            {
+                "seed": config.seed,
+                "selection_metric": metric,
+                "selection_metric_used": record.get("selection_metric_used", metric),
+                "best_epoch": int(record.get("epoch", 0) or 0),
+                "best_score": _safe_float(record.get("score")),
+                "val_metrics_at_selection": record.get("val_metrics_at_selection"),
+                "val_metrics": selected_val_metrics,
+                "test_metrics": selected_test_metrics,
+                "checkpoint_path": str(ckpt_path),
+            }
+        )
 
     model.load_state_dict(torch.load(config.output_dir / "best_model.pt", map_location=device))
     train_metrics = evaluate_model(model, train_eval_loader, device, criterion, class_names)
@@ -1880,6 +1948,8 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
         "best_epoch": best_epoch,
         "selection_metric": selection_metric,
         "best_val_metrics": best_val_metrics,
+        "extra_checkpoint_metrics": list(extra_checkpoint_metrics),
+        "multi_metric_checkpoints": multi_metric_checkpoints,
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
@@ -2321,7 +2391,16 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--gene-label-col", type=str, default=None, help="Gene TSV label column to drop from features.")
     parser.add_argument("--class-mode", type=str, choices=["multiclass", "binary"], default="binary")
     parser.add_argument("--binary-task", type=str, choices=["malignant_vs_rest", "abnormal_vs_normal", "malignant_vs_normal", "benign_vs_malignant"], default="malignant_vs_normal")
-    parser.add_argument("--selection-metric", type=str, choices=["auto", "accuracy", "balanced_accuracy", "auroc", "auprc", "f1", "loss"], default="auto")
+    parser.add_argument("--selection-metric", type=str, choices=sorted(SELECTION_METRICS), default="auto")
+    parser.add_argument(
+        "--extra-checkpoint-metrics",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated validation metrics for additional best_<metric>.pt checkpoint saving. "
+            "Each metric is resolved strictly; unavailable metrics raise an error."
+        ),
+    )
     parser.add_argument("--split-mode", type=str, choices=["train_val", "train_val_test"], default="train_val_test")
     parser.add_argument("--use-predefined-split", action="store_true", help="Use metadata split labels when available.")
     parser.add_argument("--val-ratio", type=float, default=0.2)
@@ -2440,6 +2519,7 @@ def parse_train_args() -> MultiModalTrainConfig:
         class_mode=args.class_mode,
         binary_task=args.binary_task,
         selection_metric=args.selection_metric,
+        extra_checkpoint_metrics=normalize_selection_metric_list(args.extra_checkpoint_metrics),
         split_mode=args.split_mode,
         use_predefined_split=args.use_predefined_split,
         val_ratio=args.val_ratio,
@@ -2512,6 +2592,7 @@ def parse_student_args() -> StudentKDConfig:
         class_mode=args.class_mode,
         binary_task=args.binary_task,
         selection_metric=args.selection_metric,
+        extra_checkpoint_metrics=normalize_selection_metric_list(args.extra_checkpoint_metrics),
         split_mode=args.split_mode,
         use_predefined_split=args.use_predefined_split,
         val_ratio=args.val_ratio,

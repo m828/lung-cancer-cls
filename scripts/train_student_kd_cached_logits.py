@@ -463,8 +463,11 @@ def composite_score(metrics: dict[str, Any]) -> tuple[float, str]:
         "ece": metrics.get("ece"),
     }
     if any(values[k] is None for k in values):
-        score, used = resolve_selection_score(metrics, "auroc")
-        return float(score), used
+        missing = ", ".join(k for k, value in values.items() if value is None)
+        raise ValueError(
+            "--composite-selection-metric requires all component metrics; "
+            f"missing: {missing}. Use --selection-metric explicitly for multiclass runs."
+        )
     return (
         float(values["auroc"])
         + 0.5 * float(values["balanced_accuracy"])

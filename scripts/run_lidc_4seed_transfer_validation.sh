@@ -10,6 +10,43 @@ cd "${PROJECT_ROOT}"
 export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 PARENT_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
+
+ROOT_OVERRIDE=""
+
+INIT_PREFIX="${INIT_PREFIX-__AUTO__}"
+SEEDS_ENV="${SEEDS:-}"
+FOLDS_ENV="${FOLDS:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --root)
+            if [[ $# -lt 2 ]]; then
+                echo "[ERROR] --root requires a path" >&2
+                exit 2
+            fi
+            ROOT_OVERRIDE="$2"
+            shift 2
+            ;;
+        --out-root)
+            if [[ $# -lt 2 ]]; then echo "[ERROR] --out-root requires a path" >&2; exit 2; fi
+            OUT_ROOT="$2"
+            shift 2
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -n "${ROOT_OVERRIDE}" ]]; then
+    PROJECT_ROOT="$(cd "${ROOT_OVERRIDE}" && pwd)"
+    SCRIPT_DIR="${PROJECT_ROOT}"
+    cd "${PROJECT_ROOT}"
+    export PYTHONPATH="${PROJECT_ROOT}/src:${PROJECT_ROOT}:${PYTHONPATH:-}"
+    PARENT_ROOT="$(cd "${PROJECT_ROOT}/.." && pwd)"
+fi
+
 OUT_ROOT="${OUT_ROOT:-${PARENT_ROOT}/outputs0540_lidc_4seed_transfer_validation}"
 STAGE="${STAGE:-all}"
 RUN_MODE="${RUN_MODE:-full}"
@@ -33,27 +70,6 @@ R3_ROOT="${R3_ROOT:-${PARENT_ROOT}/outputs0535_student_kd_refinement/refined_can
 R3_EXPORT_ROOT="${R3_EXPORT_ROOT:-${PARENT_ROOT}/outputs0535_student_kd_refinement/R3_checkpoint_export}"
 R3_CHECKPOINT="${R3_CHECKPOINT:-}"
 
-INIT_PREFIX="${INIT_PREFIX-__AUTO__}"
-SEEDS_ENV="${SEEDS:-}"
-FOLDS_ENV="${FOLDS:-}"
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --root)
-            shift 2
-            ;;
-        --out-root)
-            if [[ $# -lt 2 ]]; then echo "[ERROR] --out-root requires a path" >&2; exit 2; fi
-            OUT_ROOT="$2"
-            shift 2
-            ;;
-        *)
-            echo "[ERROR] Unknown argument: $1" >&2
-            exit 2
-            ;;
-    esac
-done
-
 normalize_lidc_data_base() {
     local base="${1%/}"
     if [[ "${base}" =~ ^(.+_fold)[0-9]+$ ]]; then
@@ -68,13 +84,7 @@ LIDC_DATA_BASE="$(normalize_lidc_data_base "${LIDC_DATA_BASE}")"
 PROFILE_DEFAULTS=(baseline_default kdinit_diff_lr_01)
 
 if [[ -z "${FOLDS_ENV}" ]]; then
-    if [[ "${SMOKE}" == "1" ]]; then
-        FOLDS=(0)
-    elif [[ "${RUN_MODE}" == "mini" ]]; then
-        FOLDS=(0 1)
-    else
-        FOLDS=(0)
-    fi
+    FOLDS=(0)
 else
     IFS=',' read -r -a FOLDS <<<"${FOLDS_ENV}"
 fi
@@ -441,7 +451,6 @@ python experiments/analysis/analyze_lidc_4seed_transfer_validation.py --root out
 
 ## How to judge paper-ready interpretation
 
-- If one fold only (FOLDS=0), treat as **single-fold 4-seed repeated transfer validation**, not full 5-fold external validation.\n+- Compare `lidc_4seed_comparison.md`, `lidc_4seed_seedwise.csv`, and `lidc_4seed_summary.md`.
 - If one fold only (FOLDS=0), treat as **single-fold 4-seed repeated transfer validation**, not full 5-fold external validation.
 - Compare `lidc_4seed_comparison.md`, `lidc_4seed_seedwise.csv`, and `lidc_4seed_summary.md`.
 

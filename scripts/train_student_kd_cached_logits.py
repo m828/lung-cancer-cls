@@ -12,7 +12,9 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -51,6 +53,17 @@ from lung_cancer_cls.multimodal_teacher_student import (  # noqa: E402
 )
 from lung_cancer_cls.train import SELECTION_METRICS, resolve_selection_metric, resolve_selection_score  # noqa: E402
 from lung_cancer_cls.training_components import build_class_weights, create_loss, create_optimizer, create_scheduler  # noqa: E402
+from experiments.utils.attribution_audit import (  # noqa: E402
+    AttributionAuditError,
+    atomic_torch_save,
+    atomic_write_json,
+    build_kd_weights,
+    checkpoint_filename,
+    checkpoint_payload,
+    checkpoint_score,
+    sha256_file,
+    write_csv_rows,
+)
 
 
 class SampleIdDataset(Dataset):
@@ -68,13 +81,13 @@ class SampleIdDataset(Dataset):
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--cached-teacher-targets", type=Path, required=True)
+    p.add_argument("--cached-teacher-targets", "--cached-logits-path", dest="cached_teacher_targets", type=Path, default=None)
     p.add_argument("--reference-teacher-targets", type=Path, default=None)
     p.add_argument("--s0-predictions", type=Path, default=None, help="Optional CT+Text supervised baseline predictions CSV for advantage_learnable weighting.")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--metadata-csv", type=Path, required=True)
-    p.add_argument("--reference-manifest", type=Path, required=True)
+    p.add_argument("--reference-manifest", "--split-manifest", dest="reference_manifest", type=Path, required=True)
     p.add_argument("--ct-root", type=Path, default=None)
     p.add_argument("--text-feature-tsv", type=Path, default=None)
     p.add_argument("--text-health-csv", type=Path, default=None)
@@ -88,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ct-path-col", type=str, default="CT_numpy_cloud路径")
     p.add_argument("--text-record-id-col", type=str, default="record_id")
     p.add_argument("--class-mode", type=str, choices=["multiclass", "binary"], default="binary")
-    p.add_argument("--binary-task", type=str, default="malignant_vs_normal")
+    p.add_argument("--binary-task", "--task", dest="binary_task", type=str, default="malignant_vs_normal")
     p.add_argument("--modalities", type=str, default="ct,text")
     p.add_argument("--split-mode", type=str, default="train_val_test")
     p.add_argument("--seed", type=int, default=42)
@@ -109,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", "--learning-rate", dest="lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--optimizer", type=str, choices=["adamw", "sgd"], default="adamw")
     p.add_argument("--scheduler", type=str, choices=["none", "cosine", "warmup_cosine", "onecycle", "plateau"], default="cosine")
@@ -120,8 +133,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sampling-strategy", type=str, choices=["default", "weighted", "class_balanced", "malignant_oversample"], default="weighted")
     p.add_argument("--class-weight-strategy", type=str, choices=["none", "inverse", "sqrt_inverse", "effective_num"], default="effective_num")
     p.add_argument("--effective-num-beta", type=float, default=0.999)
-    p.add_argument("--distillation-alpha", type=float, default=0.1)
-    p.add_argument("--distillation-temperature", type=float, default=4.0)
+    p.add_argument("--distillation-alpha", "--alpha", dest="distillation_alpha", type=float, default=0.1)
+    p.add_argument("--distillation-temperature", "--temperature", dest="distillation_temperature", type=float, default=4.0)
     p.add_argument("--selection-metric", type=str, choices=sorted(SELECTION_METRICS), default="auroc")
     p.add_argument("--composite-selection-metric", action="store_true")
     p.add_argument("--strict-no-leakage", action="store_true")
@@ -133,13 +146,72 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ema", type=float, default=0.0, help="EMA decay; 0 disables EMA.")
     p.add_argument("--gradient-clip", type=float, default=0.0)
     p.add_argument("--early-stopping-patience", type=int, default=0)
-    p.add_argument("--kd-weighting", type=str, choices=["none", "confidence", "margin", "class_confidence", "advantage", "advantage_learnable"], default="none")
+    p.add_argument(
+        "--kd-weighting",
+        type=str,
+        choices=["none", "uniform", "confidence", "shuffled_confidence", "margin", "class_confidence", "advantage", "advantage_learnable"],
+        default="none",
+        help="Legacy KD weighting option. Legacy `none` continues to mean equal KD weights.",
+    )
+    p.add_argument(
+        "--kd-weight-mode",
+        type=str,
+        choices=["none", "uniform", "confidence", "shuffled_confidence"],
+        default=None,
+        help="0542 attribution interface. Here `none` explicitly disables KD.",
+    )
     p.add_argument("--kd-weight-floor", type=float, default=0.0)
     p.add_argument("--kd-weight-max", type=float, default=1.0)
     p.add_argument("--malignant-kd-boost", type=float, default=1.0, help="Boost KD weight when true label or teacher top1 is malignant.")
     p.add_argument("--teacher-prob-smoothing", type=float, default=0.0, help="Uniform smoothing applied to teacher soft targets after temperature scaling.")
+    p.add_argument("--teacher-type", choices=["ct_text", "ct_text_cnv", "ct_text_permuted_cnv"], default=None)
+    p.add_argument("--teacher-checkpoint", type=Path, default=None, help="Teacher checkpoint recorded for provenance; logits remain the training input.")
+    p.add_argument("--confidence-shuffle-seed", type=int, default=None)
+    p.add_argument("--cnv-permutation-seed", type=int, default=None, help="Provenance field for a permuted-CNV teacher cache.")
+    p.add_argument(
+        "--student-checkpoint-metric",
+        choices=["composite", "val_auroc", "val_f1", "val_loss", "val_bacc"],
+        default=None,
+    )
+    p.add_argument("--save-all-checkpoint-metrics", action="store_true")
+    p.add_argument("--resume-checkpoint", type=Path, default=None)
+    p.add_argument("--smoke", action="store_true", help="Bound the run to at most two epochs; never enables full training.")
+    p.add_argument("--smoke-max-train-samples", type=int, default=24)
+    p.add_argument("--smoke-max-val-samples", type=int, default=12)
+    p.add_argument("--smoke-max-test-samples", type=int, default=12)
     p.add_argument("--no-save-predictions", action="store_true")
     return p.parse_args()
+
+
+def normalize_attribution_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Resolve the additive 0542 interface while preserving legacy defaults."""
+
+    args.kd_disabled = False
+    if args.kd_weight_mode is not None:
+        if args.kd_weight_mode == "none":
+            args.kd_disabled = True
+            args.kd_weighting = "uniform"
+            args.distillation_alpha = 0.0
+        else:
+            args.kd_weighting = args.kd_weight_mode
+    if args.student_checkpoint_metric is not None:
+        mapping = {
+            "composite": "auroc",
+            "val_auroc": "auroc",
+            "val_f1": "f1",
+            "val_loss": "loss",
+            "val_bacc": "balanced_accuracy",
+        }
+        args.selection_metric = mapping[args.student_checkpoint_metric]
+        args.composite_selection_metric = args.student_checkpoint_metric == "composite"
+    if args.smoke:
+        args.epochs = min(int(args.epochs), 2)
+        args.early_stopping_patience = 0
+    if not args.kd_disabled and args.cached_teacher_targets is None:
+        raise ValueError("--cached-teacher-targets/--cached-logits-path is required when KD is enabled")
+    if args.kd_weighting == "shuffled_confidence" and args.confidence_shuffle_seed is None:
+        args.confidence_shuffle_seed = int(args.seed) + 10_000
+    return args
 
 
 def make_config(args: argparse.Namespace) -> MultiModalTrainConfig:
@@ -234,6 +306,100 @@ def load_targets(path: Path) -> dict[str, dict[str, float]]:
     if not out:
         raise RuntimeError(f"No cached teacher targets loaded: {path}")
     return out
+
+
+def audit_cached_teacher_targets(
+    path: Path,
+    train_sample_ids: list[str],
+    train_labels: list[int],
+    teacher_type: str | None,
+) -> dict[str, Any]:
+    """Validate cache identity, split, label, confidence, and modality metadata."""
+
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fields = list(reader.fieldnames or [])
+        rows = [dict(row) for row in reader]
+    if "sample_id" not in fields:
+        raise AttributionAuditError(f"cached teacher targets lack sample_id: {path}")
+    by_id: dict[str, dict[str, str]] = {}
+    for row in rows:
+        sid = str(row.get("sample_id", "")).strip()
+        if not sid:
+            raise AttributionAuditError(f"cached teacher target has empty sample_id: {path}")
+        if sid in by_id:
+            raise AttributionAuditError(f"duplicate cached teacher sample_id: {sid}")
+        by_id[sid] = row
+
+    missing = sorted(set(train_sample_ids) - set(by_id))
+    if missing:
+        raise AttributionAuditError(f"training identities missing from cached teacher targets: {missing[:20]}")
+    label_by_id = {str(sid): int(label) for sid, label in zip(train_sample_ids, train_labels)}
+    split_mismatches: list[str] = []
+    label_mismatches: list[str] = []
+    confidence_mismatches: list[str] = []
+    for sid in train_sample_ids:
+        row = by_id[sid]
+        if row.get("split") and str(row["split"]).strip().lower() != "train":
+            split_mismatches.append(sid)
+        if row.get("y_true", "") != "" and int(float(row["y_true"])) != label_by_id[sid]:
+            label_mismatches.append(sid)
+        logit_cols = sorted(
+            (field for field in fields if field.startswith("teacher_logit_") and field.rsplit("_", 1)[1].isdigit()),
+            key=lambda field: int(field.rsplit("_", 1)[1]),
+        )
+        if logit_cols and row.get("teacher_confidence", "") != "":
+            logits = [float(row[field]) for field in logit_cols]
+            maximum = max(logits)
+            denominator = sum(math.exp(value - maximum) for value in logits)
+            expected = max(math.exp(value - maximum) / denominator for value in logits)
+            if not math.isclose(expected, float(row["teacher_confidence"]), rel_tol=1e-5, abs_tol=1e-6):
+                confidence_mismatches.append(sid)
+    if split_mismatches:
+        raise AttributionAuditError(f"training cache rows are not marked train: {split_mismatches[:20]}")
+    if label_mismatches:
+        raise AttributionAuditError(f"cached teacher labels disagree with training labels: {label_mismatches[:20]}")
+    if confidence_mismatches:
+        raise AttributionAuditError(
+            "teacher confidence is not max softmax(untempered logits) for identities: "
+            f"{confidence_mismatches[:20]}"
+        )
+
+    metadata_path = path.with_suffix(".metadata.json")
+    metadata: dict[str, Any] = {}
+    if metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        expected_modalities = {
+            "ct_text": {"ct", "text"},
+            "ct_text_cnv": {"ct", "text", "cnv"},
+            "ct_text_permuted_cnv": {"ct", "text", "cnv"},
+        }.get(teacher_type or "")
+        observed_modalities = {str(value) for value in metadata.get("teacher_modalities", [])}
+        if expected_modalities is not None and observed_modalities and observed_modalities != expected_modalities:
+            raise AttributionAuditError(
+                f"teacher cache modality mismatch for {teacher_type}: {sorted(observed_modalities)}"
+            )
+
+    split_counts: dict[str, int] = {}
+    for row in rows:
+        split = str(row.get("split", "unspecified")).strip().lower() or "unspecified"
+        split_counts[split] = split_counts.get(split, 0) + 1
+    return {
+        "cache_path": str(path),
+        "cache_sha256": sha256_file(path),
+        "metadata_path": str(metadata_path) if metadata_path.is_file() else "MISSING",
+        "metadata_sha256": sha256_file(metadata_path) if metadata_path.is_file() else "",
+        "teacher_type": teacher_type,
+        "teacher_modalities": metadata.get("teacher_modalities", []),
+        "row_count": len(rows),
+        "split_counts": split_counts,
+        "training_identity_count": len(train_sample_ids),
+        "training_identity_alignment": "OK",
+        "training_label_alignment": "OK",
+        "confidence_definition": "max softmax(raw teacher logits)",
+        "confidence_audit": "OK",
+        "test_targets_used_for_training": False,
+    }
 
 
 def _float_or_none(value: Any) -> float | None:
@@ -334,7 +500,7 @@ def raw_kd_weight(
     malignant_kd_boost: float = 1.0,
 ) -> tuple[float, dict[str, float]]:
     t1 = targets[sid]
-    if weighting == "confidence":
+    if weighting in {"confidence", "shuffled_confidence"}:
         return float(t1["confidence"]), {}
     if weighting == "class_confidence":
         teacher_top = teacher_top_class(t1)
@@ -385,7 +551,7 @@ def prepare_kd_weight_lookup(
     ref_targets: dict[str, dict[str, float]] | None,
     s0_predictions: dict[str, dict[str, float]],
     args: argparse.Namespace,
-) -> tuple[dict[str, float], dict[str, Any]]:
+) -> tuple[dict[str, float], dict[str, Any], list[dict[str, Any]]]:
     raw_rows: list[dict[str, Any]] = []
     for sid, label in zip(sample_ids, labels):
         if sid not in targets:
@@ -410,6 +576,27 @@ def prepare_kd_weight_lookup(
             normalized = row["raw_weight"]
         weights[row["sample_id"]] = max(float(args.kd_weight_floor), min(float(args.kd_weight_max), float(normalized)))
 
+    audit_rows: list[dict[str, Any]] = []
+    if args.kd_weighting in {"uniform", "confidence", "shuffled_confidence"}:
+        confidences = [float(targets[row["sample_id"]]["confidence"]) for row in raw_rows]
+        weights, mode_rows = build_kd_weights(
+            [row["sample_id"] for row in raw_rows],
+            confidences,
+            mode=args.kd_weighting,
+            floor=float(args.kd_weight_floor),
+            maximum=float(args.kd_weight_max),
+            shuffle_seed=args.confidence_shuffle_seed,
+        )
+        by_id = {str(row["sample_id"]): row for row in mode_rows}
+        for row in raw_rows:
+            sid = str(row["sample_id"])
+            audit_rows.append({**row, **by_id[sid], "effective_weight": weights[sid], "split": "train"})
+    else:
+        audit_rows = [
+            {**row, "original_weight": weights[row["sample_id"]], "effective_weight": weights[row["sample_id"]], "mode": args.kd_weighting, "split": "train"}
+            for row in raw_rows
+        ]
+
     values = list(weights.values())
     mean = float(np.mean(values)) if values else 0.0
     std = float(np.std(values)) if values else 0.0
@@ -417,6 +604,7 @@ def prepare_kd_weight_lookup(
     zero_rows = [r for r in raw_rows if weights.get(r["sample_id"], 0.0) <= 0.0]
     summary = {
         "kd_weighting": args.kd_weighting,
+        "confidence_shuffle_seed": args.confidence_shuffle_seed,
         "malignant_kd_boost": float(args.malignant_kd_boost),
         "num_samples": len(values),
         "mean": mean,
@@ -434,8 +622,9 @@ def prepare_kd_weight_lookup(
         "zero_weight_samples_count": len(zero_rows),
         "T1_advantage_samples_count": sum(1 for row in raw_rows if float(row.get("gene_advantage", 0.0)) > 0.0),
         "learnable_advantage_samples_count": sum(1 for row in raw_rows if row["raw_weight"] > 0.0),
+        "cached_targets_sha256": sha256_file(args.cached_teacher_targets) if args.cached_teacher_targets else "",
     }
-    return weights, summary
+    return weights, summary, audit_rows
 
 
 def create_scheduler_for_cached(args: argparse.Namespace, optimizer, steps_per_epoch: int):
@@ -553,29 +742,37 @@ def train_one_epoch(
         inputs = move_inputs_to_device(inputs, device)
         labels = labels.to(device)
         sample_ids = [str(x) for x in sample_ids]
-        teacher_probs, weights = batch_teacher_tensors(
-            sample_ids,
-            labels,
-            targets,
-            ref_targets,
-            kd_weight_lookup,
-            args.distillation_temperature,
-            args.kd_weighting,
-            args.kd_weight_floor,
-            args.kd_weight_max,
-            args.malignant_kd_boost,
-            args.teacher_prob_smoothing,
-            device,
-        )
+        teacher_probs = weights = None
+        if not args.kd_disabled:
+            teacher_probs, weights = batch_teacher_tensors(
+                sample_ids,
+                labels,
+                targets,
+                ref_targets,
+                kd_weight_lookup,
+                args.distillation_temperature,
+                args.kd_weighting,
+                args.kd_weight_floor,
+                args.kd_weight_max,
+                args.malignant_kd_boost,
+                args.teacher_prob_smoothing,
+                device,
+            )
         use_amp = bool(args.amp and device.type == "cuda")
         with torch.cuda.amp.autocast(enabled=use_amp):
             logits = model(inputs)
             ce = criterion(logits, labels)
-            log_prob = F.log_softmax(logits / max(args.distillation_temperature, 1e-4), dim=1)
-            kd_per = F.kl_div(log_prob, teacher_probs, reduction="none", log_target=False).sum(dim=1)
-            kd_per = kd_per * (max(args.distillation_temperature, 1e-4) ** 2)
-            kd = (kd_per * weights).sum() / weights.sum().clamp_min(1e-12)
-            loss = ce + float(args.distillation_alpha) * kd
+            if args.kd_disabled:
+                kd = torch.zeros((), dtype=ce.dtype, device=ce.device)
+                loss = ce
+            else:
+                if teacher_probs is None or weights is None:
+                    raise RuntimeError("KD tensors were not constructed for an enabled KD run")
+                log_prob = F.log_softmax(logits / max(args.distillation_temperature, 1e-4), dim=1)
+                kd_per = F.kl_div(log_prob, teacher_probs, reduction="none", log_target=False).sum(dim=1)
+                kd_per = kd_per * (max(args.distillation_temperature, 1e-4) ** 2)
+                kd = (kd_per * weights).sum() / weights.sum().clamp_min(1e-12)
+                loss = ce + float(args.distillation_alpha) * kd
             scaled_loss = loss / accum
 
         if scaler is not None:
@@ -639,8 +836,72 @@ def jsonable(value: Any) -> Any:
     return value
 
 
+def bounded_smoke_indices(cohort, indices: list[int], limit: int, seed: int) -> list[int]:
+    """Select a deterministic class-interleaved subset for execution smoke tests."""
+
+    if limit <= 0 or len(indices) <= limit:
+        return list(indices)
+    by_label: dict[int, list[int]] = {}
+    for index in indices:
+        by_label.setdefault(int(cohort.iloc[index]["label"]), []).append(index)
+    rng = __import__("random").Random(int(seed))
+    for values in by_label.values():
+        rng.shuffle(values)
+    selected: list[int] = []
+    labels = sorted(by_label)
+    while len(selected) < limit and any(by_label[label] for label in labels):
+        for label in labels:
+            if by_label[label] and len(selected) < limit:
+                selected.append(by_label[label].pop())
+    return sorted(selected)
+
+
+CHECKPOINT_CRITERIA = ("val_loss", "val_auroc", "val_f1", "val_bacc", "val_composite")
+
+
+def effective_model_state(model: nn.Module, shadow: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    source = shadow if shadow else model.state_dict()
+    return {name: value.detach().cpu().clone() for name, value in source.items()}
+
+
+def save_attribution_checkpoint(
+    path: Path,
+    *,
+    model: nn.Module,
+    shadow: dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    epoch: int,
+    criterion_name: str,
+    val_metrics: dict[str, Any],
+    args: argparse.Namespace,
+    training_state: dict[str, Any] | None = None,
+) -> None:
+    payload = checkpoint_payload(
+        model_state=effective_model_state(model, shadow),
+        optimizer_state=optimizer.state_dict(),
+        scheduler_state=scheduler.state_dict() if scheduler is not None else None,
+        epoch=epoch,
+        criterion=criterion_name,
+        val_metrics=val_metrics,
+        threshold=float(val_metrics.get("threshold", 0.5)),
+        configuration=jsonable(vars(args)),
+        training_state=jsonable(training_state) if training_state is not None else None,
+    )
+    atomic_torch_save(payload, path)
+
+
+def checkpoint_model_state(path: Path, device: torch.device) -> dict[str, torch.Tensor]:
+    payload = torch.load(path, map_location=device)
+    if isinstance(payload, dict) and "model_state_dict" in payload:
+        return payload["model_state_dict"]
+    if isinstance(payload, dict):
+        return payload
+    raise ValueError(f"Unsupported checkpoint payload: {path}")
+
+
 def main() -> int:
-    args = parse_args()
+    args = normalize_attribution_args(parse_args())
     if args.kd_weighting in {"advantage", "advantage_learnable"} and args.reference_teacher_targets is None:
         raise ValueError("--reference-teacher-targets is required for --kd-weighting advantage/advantage_learnable")
     if args.grad_accum_steps < 1:
@@ -651,8 +912,34 @@ def main() -> int:
     set_seed(args.seed)
     config = make_config(args)
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        config.output_dir / "resolved_run_config.json",
+        {"training_config": jsonable(asdict(config)), "entrypoint_args": jsonable(vars(args))},
+    )
+    run_started = time.time()
+    atomic_write_json(
+        config.output_dir / "run_provenance_start.json",
+        {
+            "started_unix": run_started,
+            "argv": sys.argv,
+            "environment": {
+                key: value
+                for key, value in sorted(os.environ.items())
+                if key.startswith(("CUDA", "SLURM", "SMOKE", "RUN_MODE", "SEEDS", "OUTPUT_ROOT"))
+            },
+            "run_mode": "smoke" if args.smoke else "full",
+            "seed": args.seed,
+            "teacher_type": args.teacher_type,
+            "teacher_checkpoint": str(args.teacher_checkpoint) if args.teacher_checkpoint else "",
+            "teacher_checkpoint_sha256": sha256_file(args.teacher_checkpoint) if args.teacher_checkpoint and args.teacher_checkpoint.is_file() else "MISSING",
+            "cached_targets": str(args.cached_teacher_targets) if args.cached_teacher_targets else "",
+            "cached_targets_sha256": sha256_file(args.cached_teacher_targets) if args.cached_teacher_targets and args.cached_teacher_targets.is_file() else "",
+            "split_manifest": str(args.reference_manifest),
+            "split_manifest_sha256": sha256_file(args.reference_manifest),
+        },
+    )
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    targets = load_targets(args.cached_teacher_targets)
+    targets = load_targets(args.cached_teacher_targets) if args.cached_teacher_targets else {}
     ref_targets = load_targets(args.reference_teacher_targets) if args.reference_teacher_targets else None
     s0_predictions = load_prediction_probs(args.s0_predictions)
 
@@ -661,6 +948,10 @@ def main() -> int:
     train_idx, val_idx, test_idx = load_split_manifest_indices(cohort, config.reference_manifest)
     if not train_idx:
         raise RuntimeError("Training split is empty.")
+    if args.smoke:
+        train_idx = bounded_smoke_indices(cohort, train_idx, args.smoke_max_train_samples, args.seed)
+        val_idx = bounded_smoke_indices(cohort, val_idx, args.smoke_max_val_samples, args.seed + 1)
+        test_idx = bounded_smoke_indices(cohort, test_idx, args.smoke_max_test_samples, args.seed + 2)
     leakage_warnings = validate_patient_split_integrity(
         cohort,
         train_idx,
@@ -688,18 +979,51 @@ def main() -> int:
     train_label_counts = [0 for _ in range(len(class_names))]
     for label in train_ds.labels:
         train_label_counts[int(label)] += 1
-    kd_weight_lookup, kd_weight_summary = prepare_kd_weight_lookup(
-        list(train_ds.sample_ids),
-        list(train_ds.labels),
-        targets,
-        ref_targets,
-        s0_predictions,
-        args,
-    )
+    if args.kd_disabled:
+        teacher_logits_audit = {
+            "kd_disabled": True,
+            "training_identity_count": len(train_ds.sample_ids),
+            "test_targets_used_for_training": False,
+        }
+        kd_weight_lookup: dict[str, float] | None = None
+        kd_weight_summary = {
+            "kd_disabled": True,
+            "kd_weighting": "none",
+            "num_samples": len(train_ds.sample_ids),
+        }
+        kd_weight_rows = [
+            {
+                "sample_id": str(sid),
+                "label": int(label),
+                "split": "train",
+                "mode": "none",
+                "original_weight": "",
+                "effective_weight": "",
+            }
+            for sid, label in zip(train_ds.sample_ids, train_ds.labels)
+        ]
+    else:
+        teacher_logits_audit = audit_cached_teacher_targets(
+            args.cached_teacher_targets,
+            [str(value) for value in train_ds.sample_ids],
+            [int(value) for value in train_ds.labels],
+            args.teacher_type,
+        )
+        kd_weight_lookup, kd_weight_summary, kd_weight_rows = prepare_kd_weight_lookup(
+            list(train_ds.sample_ids),
+            list(train_ds.labels),
+            targets,
+            ref_targets,
+            s0_predictions,
+            args,
+        )
+    atomic_write_json(config.output_dir / "teacher_logits_audit.json", teacher_logits_audit)
     (config.output_dir / "kd_sample_weights_summary.json").write_text(
         json.dumps(kd_weight_summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    weight_fields = sorted({key for row in kd_weight_rows for key in row})
+    write_csv_rows(config.output_dir / "kd_weight_mapping.csv", kd_weight_rows, weight_fields)
 
     model = create_model_from_config(config, feature_info, class_names).to(device)
     optimizer = create_optimizer(args.optimizer, model.parameters(), args.lr, args.weight_decay)
@@ -724,6 +1048,70 @@ def main() -> int:
     history: list[dict[str, Any]] = []
     shadow: dict[str, torch.Tensor] = {}
     stale_epochs = 0
+    start_epoch = 1
+    checkpoint_dir = config.output_dir / "checkpoints"
+    if args.save_all_checkpoint_metrics or args.resume_checkpoint is not None:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_best: dict[str, dict[str, Any]] = {
+        criterion_name: {"score": -float("inf"), "epoch": 0, "path": str(checkpoint_dir / checkpoint_filename(criterion_name))}
+        for criterion_name in CHECKPOINT_CRITERIA
+    }
+    if args.resume_checkpoint is not None:
+        resume_payload = torch.load(args.resume_checkpoint, map_location=device)
+        if not isinstance(resume_payload, dict) or "model_state_dict" not in resume_payload:
+            raise ValueError("--resume-checkpoint must be a structured 0542 checkpoint")
+        model.load_state_dict(resume_payload["model_state_dict"])
+        if resume_payload.get("optimizer_state_dict"):
+            optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        if scheduler is not None and resume_payload.get("scheduler_state_dict"):
+            scheduler.load_state_dict(resume_payload["scheduler_state_dict"])
+        start_epoch = int(resume_payload.get("epoch", 0)) + 1
+        training_state = resume_payload.get("training_state") or {}
+        if training_state:
+            best_score = float(training_state.get("best_score", best_score))
+            best_epoch = int(training_state.get("best_epoch", best_epoch))
+            best_val_metrics = training_state.get("best_val_metrics") or best_val_metrics
+            stale_epochs = int(training_state.get("stale_epochs", stale_epochs))
+            restored_history = training_state.get("history")
+            if isinstance(restored_history, list):
+                history = list(restored_history)
+            restored_checkpoint_best = training_state.get("checkpoint_best")
+            if isinstance(restored_checkpoint_best, dict):
+                for criterion_name in CHECKPOINT_CRITERIA:
+                    record = restored_checkpoint_best.get(criterion_name)
+                    if isinstance(record, dict):
+                        checkpoint_best[criterion_name].update(record)
+        else:
+            history_path = config.output_dir / "training_history.json"
+            if history_path.is_file():
+                try:
+                    restored_history = json.loads(history_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    restored_history = []
+                if isinstance(restored_history, list):
+                    history = restored_history
+                    completed = [row for row in history if row.get("selection_score") is not None]
+                    if completed:
+                        primary = max(completed, key=lambda row: float(row["selection_score"]))
+                        best_score = float(primary["selection_score"])
+                        best_epoch = int(primary.get("epoch", 0))
+                        best_val_metrics = {
+                            key[4:]: value for key, value in primary.items() if key.startswith("val_")
+                        }
+            inventory_path = checkpoint_dir / "checkpoint_inventory.json"
+            if inventory_path.is_file():
+                try:
+                    restored_inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    restored_inventory = {}
+                if isinstance(restored_inventory, dict):
+                    for criterion_name in CHECKPOINT_CRITERIA:
+                        record = restored_inventory.get(criterion_name)
+                        if isinstance(record, dict):
+                            checkpoint_best[criterion_name].update(record)
+        if best_epoch > 0 and not (config.output_dir / "best_model.pt").is_file():
+            raise FileNotFoundError("resume state references a primary best epoch but best_model.pt is missing")
+        print(f"[RESUME] {args.resume_checkpoint} -> epoch {start_epoch}")
 
     print("=" * 60)
     print("Cached logits KD student training")
@@ -733,7 +1121,7 @@ def main() -> int:
     print(f"Selection: {'composite' if args.composite_selection_metric else selection_metric}")
     print("=" * 60)
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_stats = train_one_epoch(
             model,
             train_loader,
@@ -776,6 +1164,7 @@ def main() -> int:
         }
         epoch_log.update({f"val_{k}": v for k, v in build_epoch_log(val_metrics).items()})
         history.append(epoch_log)
+        atomic_write_json(config.output_dir / "training_history.json", history)
 
         print(
             f"[Epoch {epoch}/{args.epochs}] train={train_stats['loss']:.4f} "
@@ -793,15 +1182,63 @@ def main() -> int:
             if shadow:
                 current = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 model.load_state_dict(shadow, strict=True)
-                torch.save(model.state_dict(), config.output_dir / "best_model.pt")
+                atomic_torch_save(model.state_dict(), config.output_dir / "best_model.pt")
                 model.load_state_dict(current, strict=True)
             else:
-                torch.save(model.state_dict(), config.output_dir / "best_model.pt")
+                atomic_torch_save(model.state_dict(), config.output_dir / "best_model.pt")
         else:
             stale_epochs += 1
-            if args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
-                print(f"[EARLY_STOP] patience reached at epoch {epoch}")
-                break
+
+        if args.save_all_checkpoint_metrics:
+            for criterion_name in CHECKPOINT_CRITERIA:
+                criterion_value = checkpoint_score(criterion_name, val_metrics)
+                record = checkpoint_best[criterion_name]
+                if int(record["epoch"]) == 0 or criterion_value > float(record["score"]):
+                    record.update(
+                        {
+                            "score": float(criterion_value),
+                            "epoch": int(epoch),
+                            "val_metrics": jsonable(val_metrics),
+                        }
+                    )
+                    save_attribution_checkpoint(
+                        Path(record["path"]),
+                        model=model,
+                        shadow=shadow,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        criterion_name=criterion_name,
+                        val_metrics=val_metrics,
+                        args=args,
+                    )
+
+        if args.save_all_checkpoint_metrics:
+            resume_state = {
+                "best_score": best_score,
+                "best_epoch": best_epoch,
+                "best_val_metrics": best_val_metrics,
+                "stale_epochs": stale_epochs,
+                "history": history,
+                "checkpoint_best": checkpoint_best,
+            }
+            save_attribution_checkpoint(
+                checkpoint_dir / "last.pt",
+                model=model,
+                shadow={},
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                criterion_name="val_composite",
+                val_metrics=val_metrics,
+                args=args,
+                training_state=resume_state,
+            )
+            atomic_write_json(checkpoint_dir / "checkpoint_inventory.json", checkpoint_best)
+
+        if best_val_metrics is not None and score <= best_score and args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
+            print(f"[EARLY_STOP] patience reached at epoch {epoch}")
+            break
 
     model.load_state_dict(torch.load(config.output_dir / "best_model.pt", map_location=device))
     train_metrics = evaluate_model(model, train_eval_loader, device, criterion, class_names)
@@ -814,8 +1251,56 @@ def main() -> int:
         if test_loader is not None and test_ds is not None:
             save_prediction_csv(config.output_dir / "test_predictions.csv", test_ds, predict_probabilities(model, test_loader, device), class_names)
 
+    multi_checkpoint_evaluations: list[dict[str, Any]] = []
+    if args.save_all_checkpoint_metrics:
+        prediction_dir = config.output_dir / "checkpoint_predictions"
+        prediction_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_paths = [
+            (criterion_name, checkpoint_dir / checkpoint_filename(criterion_name))
+            for criterion_name in CHECKPOINT_CRITERIA
+        ] + [("last", checkpoint_dir / "last.pt")]
+        for criterion_name, checkpoint_path in checkpoint_paths:
+            if not checkpoint_path.is_file():
+                multi_checkpoint_evaluations.append(
+                    {"checkpoint_criterion": criterion_name, "status": "MISSING", "checkpoint_path": str(checkpoint_path)}
+                )
+                continue
+            model.load_state_dict(checkpoint_model_state(checkpoint_path, device))
+            selected_val_metrics = evaluate_model(model, val_loader, device, criterion, class_names)
+            selected_test_metrics = evaluate_model(model, test_loader, device, criterion, class_names) if test_loader is not None else None
+            if config.save_predictions:
+                save_prediction_csv(
+                    prediction_dir / f"{criterion_name}_val_predictions.csv",
+                    val_ds,
+                    predict_probabilities(model, val_loader, device),
+                    class_names,
+                )
+                if test_loader is not None and test_ds is not None:
+                    save_prediction_csv(
+                        prediction_dir / f"{criterion_name}_test_predictions.csv",
+                        test_ds,
+                        predict_probabilities(model, test_loader, device),
+                        class_names,
+                    )
+            payload = torch.load(checkpoint_path, map_location="cpu")
+            multi_checkpoint_evaluations.append(
+                {
+                    "checkpoint_criterion": criterion_name,
+                    "status": "complete",
+                    "checkpoint_path": str(checkpoint_path),
+                    "checkpoint_sha256": sha256_file(checkpoint_path),
+                    "epoch": int(payload.get("epoch", 0)) if isinstance(payload, dict) else 0,
+                    "validation_threshold": payload.get("validation_threshold") if isinstance(payload, dict) else None,
+                    "val_metrics": jsonable(selected_val_metrics),
+                    "test_metrics": jsonable(selected_test_metrics),
+                    "test_metrics_used_for_selection": False,
+                }
+            )
+        model.load_state_dict(torch.load(config.output_dir / "best_model.pt", map_location=device))
+        atomic_write_json(config.output_dir / "checkpoint_evaluations.json", multi_checkpoint_evaluations)
+
     metrics = {
-        "family": "cached_logits_kd_student",
+        "family": "matched_supervised_student" if args.kd_disabled else "cached_logits_kd_student",
         "best_epoch": best_epoch,
         "selection_metric": "composite" if args.composite_selection_metric else selection_metric,
         "best_val_metrics": best_val_metrics,
@@ -830,7 +1315,14 @@ def main() -> int:
         "distillation_alpha": args.distillation_alpha,
         "distillation_temperature": args.distillation_temperature,
         "kd_weighting": args.kd_weighting,
+        "kd_disabled": bool(args.kd_disabled),
+        "teacher_type": args.teacher_type,
+        "teacher_checkpoint": str(args.teacher_checkpoint) if args.teacher_checkpoint else "",
+        "teacher_checkpoint_sha256": sha256_file(args.teacher_checkpoint) if args.teacher_checkpoint and args.teacher_checkpoint.is_file() else "",
+        "cnv_permutation_seed": args.cnv_permutation_seed,
+        "teacher_logits_audit": teacher_logits_audit,
         "kd_sample_weights_summary": kd_weight_summary,
+        "multi_checkpoint_evaluations": multi_checkpoint_evaluations,
         "cohort_stats": {
             **cohort_stats,
             "num_total": int(len(cohort)),
@@ -846,6 +1338,22 @@ def main() -> int:
     }
     with (config.output_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
+    run_finished = time.time()
+    atomic_write_json(
+        config.output_dir / "run_complete.json",
+        {
+            "status": "complete",
+            "run_mode": "smoke" if args.smoke else "full",
+            "seed": args.seed,
+            "started_unix": run_started,
+            "finished_unix": run_finished,
+            "duration_seconds": run_finished - run_started,
+            "metrics_sha256": sha256_file(config.output_dir / "metrics.json"),
+            "student_checkpoint": str(config.output_dir / "best_model.pt"),
+            "student_checkpoint_sha256": sha256_file(config.output_dir / "best_model.pt"),
+            "old_outputs_modified": False,
+        },
+    )
     print("=" * 60)
     print("Cached logits KD training complete")
     print(f"Best epoch: {best_epoch}")

@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--root", type=Path, default=Path("../outputs0541_triclass_teacher_student_selection_4seed"))
     p.add_argument("--source-root", type=Path, default=Path("../outputs0536_triclass_extension"))
     p.add_argument("--bootstrap-iters", type=int, default=2000)
+    p.add_argument("--teacher-only", action="store_true", help="Write teacher checkpoint and four-seed summaries only")
     return p.parse_args()
 
 
@@ -346,6 +347,51 @@ def write_teacher_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
     (root / "teacher_checkpoint_selection_summary.md").write_text(text, encoding="utf-8")
 
 
+def write_teacher_four_seed_summary(root: Path, rows: list[dict[str, Any]]) -> None:
+    complete = [row for row in rows if row.get("status") == "complete"]
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in complete:
+        grouped.setdefault(str(row.get("selection_metric", "")), []).append(row)
+
+    fields = ["selection_metric", "n_seeds"]
+    for metric in METRICS:
+        fields.extend([f"test_{metric}_mean", f"test_{metric}_std"])
+
+    summary_rows: list[dict[str, Any]] = []
+    for selection_metric, metric_rows in sorted(grouped.items()):
+        record: dict[str, Any] = {
+            "selection_metric": selection_metric,
+            "n_seeds": len({str(row.get("seed", "")) for row in metric_rows}),
+        }
+        for metric in METRICS:
+            values = [
+                float(row[f"test_{metric}"])
+                for row in metric_rows
+                if isinstance(row.get(f"test_{metric}"), (float, int))
+                and math.isfinite(float(row[f"test_{metric}"]))
+            ]
+            record[f"test_{metric}_mean"] = statistics.mean(values) if values else ""
+            record[f"test_{metric}_std"] = statistics.stdev(values) if len(values) > 1 else (0.0 if values else "")
+        summary_rows.append(record)
+
+    write_csv(root / "triclass_teacher_4seed_summary.csv", summary_rows, fields)
+    if not summary_rows:
+        text = "# TRI-T Four-Seed Teacher Summary\n\nMISSING: no complete teacher checkpoint records found.\n"
+    else:
+        headers = ["selection metric", "n", "Acc", "macro-AUROC", "macro-F1", "BAcc", "normal-rec", "benign-rec", "mal-rec", "ECE", "Brier"]
+        body = []
+        for row in summary_rows:
+            values = []
+            for metric in ["accuracy", "macro_auroc", "macro_f1", "balanced_accuracy", "normal_recall", "benign_recall", "malignant_recall", "ece", "brier_score"]:
+                mean = row.get(f"test_{metric}_mean")
+                std = row.get(f"test_{metric}_std")
+                values.append(f"{mean:.4f}+/-{std:.4f}" if isinstance(mean, float) and isinstance(std, float) else "-")
+            body.append([str(row["selection_metric"]), str(row["n_seeds"]), *values])
+        text = "# TRI-T Four-Seed Teacher Summary\n\n" + md_table(headers, body) + "\n"
+        text += "\nThe row used to generate the primary four-seed KD student is `accuracy`. Selection metrics refer to validation checkpoint selection; all displayed values are test-set mean+/-sample SD across seeds.\n"
+    (root / "triclass_teacher_4seed_summary.md").write_text(text, encoding="utf-8")
+
+
 def write_student_outputs(root: Path, rows: list[dict[str, Any]]) -> None:
     fields = ["status", "mode", "group", "teacher_selection_metric", "student_selection_metric", "seed", "best_epoch", *METRICS, "num_samples", "run_dir"]
     write_csv(root / "triclass_student_4seed_metrics.csv", rows, fields)
@@ -514,11 +560,18 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
 
     t_rows = teacher_rows(root)
+    if args.teacher_only:
+        write_teacher_outputs(root, t_rows)
+        write_teacher_four_seed_summary(root, t_rows)
+        print(f"[OK] wrote triclass teacher-only analysis under {root}")
+        return 0
+
     s_rows = student_rows(root)
     b_rows = baseline_rows(source_root)
     boot_rows = bootstrap(root, source_root, s_rows, args.bootstrap_iters)
 
     write_teacher_outputs(root, t_rows)
+    write_teacher_four_seed_summary(root, t_rows)
     write_student_outputs(root, s_rows)
     write_csv(root / "triclass_4seed_bootstrap.csv", boot_rows, ["comparison", "teacher_selection_metric", "metric", "delta", "ci95_low", "ci95_high", "ci_crosses_0", "n_seeds", "n_samples", "n_bootstrap"])
     write_comparison(root, t_rows, s_rows, b_rows, boot_rows)

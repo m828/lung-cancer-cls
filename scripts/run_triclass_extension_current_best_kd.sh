@@ -31,6 +31,9 @@ KD_TEMPERATURE="${KD_TEMPERATURE:-8}"
 TRI_KD_SELECTION_METRIC="${TRI_KD_SELECTION_METRIC:-balanced_accuracy}"
 TRI_KD_OUTPUT_SUBDIR="${TRI_KD_OUTPUT_SUBDIR:-student_kd_ct_text_from_gene_teacher_bacc_select}"
 RESULTS_ROOT_HINT="${RESULTS_ROOT:-}"
+# Optional external teacher run root used to lock TRI-S0 to an existing
+# teacher cohort/split, e.g. outputs0541.../teacher_ct_cnv_text.
+REFERENCE_TEACHER_ROOT="${REFERENCE_TEACHER_ROOT:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -368,6 +371,10 @@ supervised_dir() {
 }
 
 teacher_manifest() {
+    if [[ -n "${REFERENCE_TEACHER_ROOT}" ]]; then
+        echo "${REFERENCE_TEACHER_ROOT}/TRI-T_multi_select_seed${1}/split_manifest.csv"
+        return 0
+    fi
     echo "$(teacher_dir "$1")/split_manifest.csv"
 }
 
@@ -398,8 +405,15 @@ stage_supervised() {
     local manifest_arg=()
     for seed in "${SEEDS[@]}"; do
         manifest_arg=()
-        if [[ -f "$(teacher_manifest "${seed}")" || "${DRY_RUN}" == "1" ]]; then
-            manifest_arg=(--reference-manifest "$(teacher_manifest "${seed}")")
+        local manifest
+        manifest="$(teacher_manifest "${seed}")"
+        if [[ -f "${manifest}" ]]; then
+            manifest_arg=(--reference-manifest "${manifest}")
+        elif [[ -n "${REFERENCE_TEACHER_ROOT}" ]]; then
+            echo "[ERROR] TRI-S0_seed${seed}: external teacher split manifest missing: ${manifest}" >&2
+            return 1
+        elif [[ "${DRY_RUN}" == "1" ]]; then
+            manifest_arg=(--reference-manifest "${manifest}")
         else
             echo "[WARN] TRI-S0_seed${seed}: teacher split manifest missing; falling back to metadata predefined split"
         fi
@@ -478,6 +492,7 @@ SMOKE              : ${SMOKE}
 DRY_RUN            : ${DRY_RUN}
 SEEDS              : ${SEEDS[*]}
 SOURCE_FROM_CURRENT_MAIN: ${SOURCE_FROM_CURRENT_MAIN}
+REFERENCE_TEACHER_ROOT: ${REFERENCE_TEACHER_ROOT:-<local OUT_ROOT teacher runs>}
 metadata_csv       : ${METADATA_CSV:-<missing>}
 ct_root            : ${CT_ROOT:-<missing>}
 gene_tsv           : ${GENE_TSV:-<missing>}

@@ -1,0 +1,13 @@
+suite: privileged_genomic_attribution_0542
+task: malignant_vs_normal
+teacher_types: [ct_text, ct_text_permuted_cnv, ct_text_cnv]
+cnv_permutation_seed_offset: 20000
+permutation_unit: whole_cnv_feature_row
+permutation_scope: independently_within_train_val_test
+selection_metric: val_auroc
+student_kd_weight_mode: confidence
+invariants:
+  - no_cross_split_donor
+  - feature_columns_not_independently_shuffled
+  - labels_not_used_for_permutation
+  - mapping_manifest_required

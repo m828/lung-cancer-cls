@@ -1,0 +1,13 @@
+suite: privileged_genomic_attribution_0542
+source: outputs0541_triclass_teacher_student_selection_4seed
+models: [TRI-T, TRI-S0, TRI-SKD]
+seeds: [42, 43, 44, 45]
+class_mapping_source_priority:
+  - metrics_json_class_names
+  - prediction_probability_columns
+  - explicit_cli_override
+class_order: [normal, benign, malignant]
+aggregation: per_seed_then_mean_and_sample_sd
+figures:
+  vector_pdf: true
+  png_dpi: 300

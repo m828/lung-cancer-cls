@@ -1,0 +1,13 @@
+suite: privileged_genomic_attribution_0542
+task: malignant_vs_normal
+seeds: [42, 43, 44, 45]
+primary_teacher_threshold: 0.5
+sensitivity_teacher_threshold: validation_selected
+groups:
+  A: ct_text_teacher_wrong_full_teacher_correct
+  B: both_teachers_correct
+  C: ct_text_teacher_correct_full_teacher_wrong
+  D: both_teachers_wrong
+bootstrap_iterations_full: 10000
+bootstrap_iterations_smoke: 100
+ensemble_analysis: sensitivity_only

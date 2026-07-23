@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -59,6 +60,17 @@ DISTILL_METHOD_ALIASES = {
     "at": "attention",
     "attention_transfer": "attention",
 }
+
+
+def atomic_torch_save(value: Any, path: Path) -> None:
+    """Write a checkpoint through a sibling temporary file and atomic rename."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    torch.save(value, temporary)
+    os.replace(temporary, path)
+
+
 UNSPECIFIED_SPLITS = {"", "none", "nan", "null", "unspecified"}
 
 
@@ -131,6 +143,10 @@ class MultiModalTrainConfig:
     class_weight_strategy: str = "effective_num"
     effective_num_beta: float = 0.999
     save_predictions: bool = True
+    smoke: bool = False
+    smoke_max_train_samples: int = 24
+    smoke_max_val_samples: int = 12
+    smoke_max_test_samples: int = 12
 
 
 @dataclass
@@ -709,6 +725,31 @@ def split_cohort(
     train_val_idx, test_idx = _safe_split(all_indices, labels, config.test_ratio, config.seed)
     train_idx, val_idx = _safe_split(train_val_idx, labels[train_val_idx], config.val_ratio, config.seed)
     return train_idx, val_idx, test_idx, "stratified_random"
+
+
+def bounded_smoke_split_indices(
+    cohort: pd.DataFrame,
+    indices: Sequence[int],
+    limit: int,
+    seed: int,
+) -> List[int]:
+    """Return a deterministic class-interleaved subset for smoke execution."""
+
+    if limit <= 0 or len(indices) <= limit:
+        return list(indices)
+    rng = np.random.default_rng(int(seed))
+    by_label: Dict[int, List[int]] = {}
+    for index in indices:
+        by_label.setdefault(int(cohort.iloc[int(index)]["label"]), []).append(int(index))
+    for values in by_label.values():
+        rng.shuffle(values)
+    selected: List[int] = []
+    labels = sorted(by_label)
+    while len(selected) < limit and any(by_label[label] for label in labels):
+        for label in labels:
+            if by_label[label] and len(selected) < limit:
+                selected.append(by_label[label].pop())
+    return sorted(selected)
 
 
 class UnifiedMultiModalDataset(Dataset):
@@ -1774,6 +1815,11 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
         split_source = "reference_manifest"
     else:
         train_idx, val_idx, test_idx, split_source = split_cohort(cohort, config)
+    if config.smoke:
+        train_idx = bounded_smoke_split_indices(cohort, train_idx, config.smoke_max_train_samples, config.seed)
+        val_idx = bounded_smoke_split_indices(cohort, val_idx, config.smoke_max_val_samples, config.seed + 1)
+        test_idx = bounded_smoke_split_indices(cohort, test_idx, config.smoke_max_test_samples, config.seed + 2)
+        split_source = f"{split_source}_smoke_subset"
     if not train_idx:
         raise RuntimeError("Training split is empty.")
     leakage_warnings = validate_patient_split_integrity(
@@ -1895,7 +1941,7 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
             best_val_score = selection_score
             best_epoch = epoch
             best_val_metrics = val_metrics
-            torch.save(model.state_dict(), config.output_dir / "best_model.pt")
+            atomic_torch_save(model.state_dict(), config.output_dir / "best_model.pt")
             print(f"  保存最佳模型 (epoch {epoch})")
 
         for metric in extra_checkpoint_metrics:
@@ -1906,7 +1952,7 @@ def train_multimodal_model(config: MultiModalTrainConfig) -> Dict[str, Any]:
                 record["epoch"] = epoch
                 record["selection_metric_used"] = metric_used
                 record["val_metrics_at_selection"] = val_metrics
-                torch.save(model.state_dict(), config.output_dir / f"best_{metric}.pt")
+                atomic_torch_save(model.state_dict(), config.output_dir / f"best_{metric}.pt")
                 print(f"  保存 {metric} 最佳模型 (epoch {epoch})")
 
     multi_metric_checkpoints: List[Dict[str, Any]] = []
@@ -2263,7 +2309,7 @@ def train_student_kd(config: StudentKDConfig) -> Dict[str, Any]:
             best_val_score = selection_score
             best_epoch = epoch
             best_val_metrics = val_metrics
-            torch.save(student_model.state_dict(), config.output_dir / "best_model.pt")
+            atomic_torch_save(student_model.state_dict(), config.output_dir / "best_model.pt")
             print(f"  保存最佳学生模型 (epoch {epoch})")
 
     student_model.load_state_dict(torch.load(config.output_dir / "best_model.pt", map_location=device))
@@ -2438,6 +2484,10 @@ def add_common_cli_args(parser: argparse.ArgumentParser, require_core_paths: boo
     parser.add_argument("--class-weight-strategy", type=str, choices=["none", "inverse", "sqrt_inverse", "effective_num"], default="effective_num")
     parser.add_argument("--effective-num-beta", type=float, default=0.999)
     parser.add_argument("--no-save-predictions", action="store_true", help="Disable prediction CSV export.")
+    parser.add_argument("--smoke", action="store_true", help="Use a bounded class-interleaved subset for execution smoke tests.")
+    parser.add_argument("--smoke-max-train-samples", type=int, default=24)
+    parser.add_argument("--smoke-max-val-samples", type=int, default=12)
+    parser.add_argument("--smoke-max-test-samples", type=int, default=12)
     return parser
 
 
@@ -2553,6 +2603,10 @@ def parse_train_args() -> MultiModalTrainConfig:
         class_weight_strategy=args.class_weight_strategy,
         effective_num_beta=args.effective_num_beta,
         save_predictions=not args.no_save_predictions,
+        smoke=args.smoke,
+        smoke_max_train_samples=args.smoke_max_train_samples,
+        smoke_max_val_samples=args.smoke_max_val_samples,
+        smoke_max_test_samples=args.smoke_max_test_samples,
     )
 
 
@@ -2626,6 +2680,10 @@ def parse_student_args() -> StudentKDConfig:
         class_weight_strategy=args.class_weight_strategy,
         effective_num_beta=args.effective_num_beta,
         save_predictions=not args.no_save_predictions,
+        smoke=args.smoke,
+        smoke_max_train_samples=args.smoke_max_train_samples,
+        smoke_max_val_samples=args.smoke_max_val_samples,
+        smoke_max_test_samples=args.smoke_max_test_samples,
         teacher_run_dir=args.teacher_run_dir,
         distillation_alpha=args.distillation_alpha,
         distillation_temperature=args.distillation_temperature,

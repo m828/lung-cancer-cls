@@ -1,0 +1,15 @@
+suite: privileged_genomic_attribution_0542
+primary_checkpoint: best_val_composite.pt
+saved_checkpoints:
+  - best_val_loss.pt
+  - best_val_auroc.pt
+  - best_val_f1.pt
+  - best_val_bacc.pt
+  - best_val_composite.pt
+  - last.pt
+analysis_arms:
+  - S0_MATCHED
+  - KD_CT_TEXT_CONFIDENCE
+  - KD_CT_TEXT_CNV_UNIFORM
+  - KD_CT_TEXT_CNV_CONFIDENCE
+prohibition: test_metrics_never_select_checkpoint

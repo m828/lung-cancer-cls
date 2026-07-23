@@ -1,0 +1,39 @@
+suite: privileged_genomic_attribution_0542
+task: malignant_vs_normal
+run_mode: controlled_by_SMOKE_and_RUN_MODE_environment
+seeds: [42, 43, 44, 45]
+student:
+  modalities: [ct, text]
+  ct_model: densenet3d_121
+  optimizer: adamw
+  scheduler: cosine
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  batch_size: 12
+  max_epochs: 50
+  early_stopping_patience: 10
+  label_smoothing: 0.05
+  sampling_strategy: weighted
+  class_weight_strategy: effective_num
+  checkpoint_metric: composite
+distillation:
+  alpha: 0.1
+  temperature: 8.0
+  confidence_floor: 0.05
+  confidence_maximum: 1.0
+  confidence_source: untempered_teacher_softmax
+  kd_normalization: batch_weight_sum
+  arms:
+    - S0_MATCHED
+    - KD_CT_TEXT_UNIFORM
+    - KD_CT_TEXT_CONFIDENCE
+    - KD_CT_TEXT_CNV_UNIFORM
+    - KD_CT_TEXT_CNV_CONFIDENCE
+analysis:
+  bootstrap_iterations_full: 10000
+  bootstrap_iterations_smoke: 100
+  ece_bins: 10
+  resampling_unit: common_test_identity_within_seed
+reference_context:
+  S0_LOCKED_PRIMARY: read_only_paper_reference_not_used_as_the_matched_factorial_arm
+  S0_MATCHED: R3_student_configuration_with_KD_disabled

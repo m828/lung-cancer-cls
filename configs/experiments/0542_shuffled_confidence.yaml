@@ -1,0 +1,13 @@
+suite: privileged_genomic_attribution_0542
+task: malignant_vs_normal
+teacher_type: ct_text_cnv
+cached_logits_reused_across_modes: true
+weight_modes: [uniform, confidence, shuffled_confidence]
+confidence_shuffle_seed_offset: 10000
+shuffle_scope: train_split_only
+invariants:
+  - logits_unchanged
+  - labels_unchanged
+  - sample_order_unchanged
+  - weight_multiset_unchanged
+  - no_cross_split_permutation

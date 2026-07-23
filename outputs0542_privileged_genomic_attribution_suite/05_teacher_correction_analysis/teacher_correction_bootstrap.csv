@@ -1,2 +1,0 @@
-metric,delta_kd_minus_supervised,ci95_low,ci95_high,ci_crosses_zero,n_bootstrap_valid,median_group_a_resample_size,status
-accuracy,0.011111111111111113,-0.10576923076923075,0.12581699346405228,True,10000,10.0,descriptive_with_bootstrap_interval
